@@ -92,10 +92,18 @@ def ship_alert(raw_log: str, stack_tag: str = "Linux"):
     headers = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
     print(f"[SentinelOps Agent -> {BACKEND_URL}] Shipping telemetry from '{hostname}' (CPU:{cpu_load}, RAM:{mem_pct}%, Disk:{disk_pct}%)...")
     resp = requests.post(BACKEND_URL, json=payload, headers=headers, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    print(f"[Success] Incident #{data['incident_id']} logged! Risk={data['diagnosis']['risk_level']}")
-    print(f"Root Cause: {data['diagnosis']['root_cause']}")
+
+    if not resp.ok:
+        print(f"Error [{resp.status_code}]:", resp.text)
+        resp.raise_for_status()
+
+    try:
+        data = resp.json()
+    except requests.exceptions.JSONDecodeError as exc:
+        raise RuntimeError("Backend returned a non-JSON success response.") from exc
+
+    print(f"[Success] Incident #{data.get('incident_id')} logged! Risk={data.get('diagnosis', {}).get('risk_level')}")
+    print(f"Root Cause: {data.get('diagnosis', {}).get('root_cause')}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SentinelOps Linux Diagnostic Log Collector Agent")
