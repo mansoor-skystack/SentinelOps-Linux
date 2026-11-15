@@ -11,7 +11,6 @@ import subprocess
 import argparse
 import time
 import requests
-import psutil
 
 BACKEND_URL = os.getenv("SENTINELOPS_URL") or os.getenv("SENTINELOPS_API_URL", "https://sentinelops-linux.onrender.com")
 API_ENDPOINT = BACKEND_URL.rstrip("/")
