@@ -197,3 +197,30 @@ def export_postmortem(incident_id: int):
 """
     finally:
         db.close()
+
+from .remediator import SSHRemediationEngine
+
+@app.post("/api/remediate/{incident_id}")
+def approve_and_remediate(incident_id: int):
+    db = SessionLocal()
+    try:
+        rec = db.query(IncidentRecord).filter(IncidentRecord.id == incident_id).first()
+        if not rec:
+            raise HTTPException(status_code=404, detail="Incident record not found")
+
+        commands = json.loads(rec.fix_commands or "[]")
+        if not commands:
+            raise HTTPException(status_code=400, detail="No remediation commands associated with this incident")
+
+        execution_report = SSHRemediationEngine.execute_fix(
+            hostname=rec.hostname,
+            commands=commands,
+            risk_level=rec.risk_level
+        )
+        return {
+            "incident_id": rec.id,
+            "hostname": rec.hostname,
+            "remediation": execution_report
+        }
+    finally:
+        db.close()
