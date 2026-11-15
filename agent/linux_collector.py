@@ -11,8 +11,10 @@ import subprocess
 import argparse
 import time
 import requests
+import psutil
 
-BACKEND_URL = os.getenv("SENTINELOPS_URL", "http://localhost:8000/api/webhook/ingest")
+BACKEND_URL = os.getenv("SENTINELOPS_API_URL", "https://sentinelops-linux.onrender.com")
+API_ENDPOINT = f"{BACKEND_URL}/api/webhook/ingest"
 API_KEY = os.getenv("SENTINELOPS_API_KEY", "SentinelOps-webhook-secret-2026")
 
 SIMULATED_CRASHES = {
