@@ -44,6 +44,7 @@
       const [result, setResult] = useState(null);
       const [incidents, setIncidents] = useState([]);
       const [loading, setLoading] = useState(false);
+      const [errorMsg, setErrorMsg] = useState(null);
       const [copied, setCopied] = useState(false);
 
       const fetchIncidents = async () => {
@@ -62,6 +63,7 @@
       const runDiagnosis = async (sourceType = "manual") => {
         if (!rawLog.trim()) return;
         setLoading(true);
+        setErrorMsg(null);
         try {
           const res = await fetch("/api/diagnose", {
             method: "POST",
@@ -74,8 +76,13 @@
             })
           });
           const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data.detail || JSON.stringify(data) || "Server error");
+          }
           setResult(data);
           fetchIncidents();
+        } catch (err) {
+          setErrorMsg(err.message);
         } finally {
           setLoading(false);
         }
@@ -169,6 +176,11 @@
             </div>
 
             <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-xl p-5">
+              {errorMsg && (
+                <div role="alert" className="bg-red-950/90 border border-red-500 text-red-200 p-4 rounded-lg text-xs font-semibold mb-4">
+                  API Error: {errorMsg}
+                </div>
+              )}
               {!result ? (
                 <div className="h-full flex flex-col items-center justify-center text-center py-16 text-slate-500">
                   <p className="text-base font-medium text-slate-400">SentinelOps Ready for Incident Triage</p>
