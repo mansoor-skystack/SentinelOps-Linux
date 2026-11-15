@@ -1,0 +1,16 @@
+[Unit]
+Description=SentinelOps Automated Linux Diagnostic Log Collector Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment="SENTINELOPS_URL=https://sentinelops-linux.onrender.com/api/webhook/ingest"
+Environment="SENTINELOPS_API_KEY=SentinelOps-webhook-secret-2026"
+ExecStart=/usr/bin/python3 /opt/sentinelops/linux_collector.py --daemon --interval 30
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,152 @@
+[
+  {
+    "id": "Q01",
+    "stack": "Linux",
+    "query": "nginx: [emerg] bind() to 0.0.0.0:80 failed (98: Address already in use)",
+    "expected_source": "linux-systemd-man.md"
+  },
+  {
+    "id": "Q02",
+    "stack": "Linux",
+    "query": "Out of memory: Killed process 4412 (python3) - OOM killer signal 9 exit code 137",
+    "expected_source": "linux-memory-oom.md"
+  },
+  {
+    "id": "Q03",
+    "stack": "Nginx",
+    "query": "502 Bad Gateway connect() failed (111: Connection refused) while connecting to upstream 127.0.0.1:8000",
+    "expected_source": "nginx-reverse-proxy.md"
+  },
+  {
+    "id": "Q04",
+    "stack": "Linux",
+    "query": "write /var/log/syslog: No space left on device (ENOSPC) disk 100% full",
+    "expected_source": "linux-systemd-man.md"
+  },
+  {
+    "id": "Q05",
+    "stack": "Docker",
+    "query": "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock",
+    "expected_source": "docker-containers.md"
+  },
+  {
+    "id": "Q06",
+    "stack": "Linux",
+    "query": "systemd service failed at step EXEC spawning /usr/local/bin/healthcheck.sh: Permission denied (EACCES)",
+    "expected_source": "linux-systemd-man.md"
+  },
+  {
+    "id": "Q07",
+    "stack": "Database",
+    "query": "psycopg2.OperationalError: FATAL: password authentication failed for user admin on port 5432",
+    "expected_source": "postgresql-database.md"
+  },
+  {
+    "id": "Q08",
+    "stack": "Docker",
+    "query": "Bind for 0.0.0.0:8080 failed: port is already allocated when running docker compose",
+    "expected_source": "docker-containers.md"
+  },
+  {
+    "id": "Q09",
+    "stack": "Linux",
+    "query": "systemctl status nginx.service shows Active: failed (Result: exit-code) EADDRINUSE",
+    "expected_source": "linux-systemd-man.md"
+  },
+  {
+    "id": "Q10",
+    "stack": "Linux",
+    "query": "kernel oom_reaper reaped process due to high RSS memory usage",
+    "expected_source": "linux-memory-oom.md"
+  },
+  {
+    "id": "Q11",
+    "stack": "Nginx",
+    "query": "Nginx reverse proxy returning HTTP 502 because upstream backend socket refused connection",
+    "expected_source": "nginx-reverse-proxy.md"
+  },
+  {
+    "id": "Q12",
+    "stack": "Linux",
+    "query": "journalctl unable to rotate logs because /var partition has zero free inodes or blocks",
+    "expected_source": "linux-systemd-man.md"
+  },
+  {
+    "id": "Q13",
+    "stack": "Database",
+    "query": "PostgreSQL connection timed out on port 5432 due to missing sslmode=require",
+    "expected_source": "postgresql-database.md"
+  },
+  {
+    "id": "Q14",
+    "stack": "Docker",
+    "query": "Cannot connect to Docker daemon. Is the docker daemon running on this host?",
+    "expected_source": "docker-containers.md"
+  },
+  {
+    "id": "Q15",
+    "stack": "Linux",
+    "query": "bash: /usr/local/bin/cleanup.sh: Permission denied exit code 126",
+    "expected_source": "linux-systemd-man.md"
+  },
+  {
+    "id": "Q16",
+    "stack": "Linux",
+    "query": "ss -tulpn shows apache2 occupying port 80 preventing nginx from binding",
+    "expected_source": "linux-systemd-man.md"
+  },
+  {
+    "id": "Q17",
+    "stack": "Linux",
+    "query": "dmesg shows anon-rss memory limit exceeded and oom_score killed java process",
+    "expected_source": "linux-memory-oom.md"
+  },
+  {
+    "id": "Q18",
+    "stack": "Nginx",
+    "query": "upstream prematurely closed connection while reading response header from upstream on port 8000",
+    "expected_source": "nginx-reverse-proxy.md"
+  },
+  {
+    "id": "Q19",
+    "stack": "Docker",
+    "query": "container exited with code 137 during docker compose deployment",
+    "expected_source": "docker-containers.md"
+  },
+  {
+    "id": "Q20",
+    "stack": "Database",
+    "query": "pg_isready reports no response from database server host on TCP port 5432",
+    "expected_source": "postgresql-database.md"
+  },
+  {
+    "id": "Q21",
+    "stack": "Linux",
+    "query": "vacuum systemd journal archives to reclaim /var/log disk usage",
+    "expected_source": "linux-systemd-man.md"
+  },
+  {
+    "id": "Q22",
+    "stack": "Linux",
+    "query": "configure systemd MemoryMax cgroup limit to stop process from exhausting swap",
+    "expected_source": "linux-memory-oom.md"
+  },
+  {
+    "id": "Q23",
+    "stack": "Nginx",
+    "query": "nginx -t syntax ok but reload fails because app-backend.service is down",
+    "expected_source": "nginx-reverse-proxy.md"
+  },
+  {
+    "id": "Q24",
+    "stack": "Docker",
+    "query": "usermod -aG docker needed to fix unix socket permission error",
+    "expected_source": "docker-containers.md"
+  },
+  {
+    "id": "Q25",
+    "stack": "Database",
+    "query": "pg_hba.conf rejects client connection without TLS sslmode=require",
+    "expected_source": "postgresql-database.md"
+  }
+]
