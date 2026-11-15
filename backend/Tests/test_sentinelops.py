@@ -4,10 +4,13 @@ from app.main import app
 from app.sanitizer import LogSanitizer
 from app.guardrails import CommandSafetyGuardrail
 
-client = TestClient(app)
+@pytest.fixture(scope="module")
+def client():
+    with TestClient(app) as test_client:
+        yield test_client
 
 
-def test_health_endpoint():
+def test_health_endpoint(client):
     res = client.get("/api/health")
     assert res.status_code == 200
     body = res.json()
@@ -39,7 +42,11 @@ def test_command_safety_guardrail_allows_safe():
     assert flagged == []
 
 
-def test_diagnose_and_remediate_workflow():
+def test_diagnose_and_remediate_workflow(client, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "")
+    monkeypatch.delenv("TARGET_SSH_KEY_PATH", raising=False)
+    monkeypatch.delenv("TARGET_SSH_PASSWORD", raising=False)
+
     res = client.post("/api/diagnose", json={
         "raw_log": "nginx: [emerg] bind() to 0.0.0.0:80 failed (98: Address already in use)",
         "stack_filter": "Nginx",
