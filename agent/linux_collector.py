@@ -90,20 +90,20 @@ def ship_alert(raw_log: str, stack_tag: str = "Linux"):
         "raw_log": raw_log
     }
     headers = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
-    print(f"[SentinelOps Agent -> {BACKEND_URL}] Shipping telemetry from '{hostname}' (CPU:{cpu_load}, RAM:{mem_pct}%, Disk:{disk_pct}%)...")
-    resp = requests.post(BACKEND_URL, json=payload, headers=headers, timeout=20)
+    print(f"[SentinelOps Agent -> {BACKEND_URL}] Shipping telemetry from '{hostname}'...")
+    
+    resp = requests.post(API_ENDPOINT, json=payload, headers=headers)
+    print(f"Response Status: {resp.status_code}")
+    print(f"Response Body: {resp.text}")  # <-- This will print the actual error HTML/text from Render
 
-    if not resp.ok:
-        print(f"Error [{resp.status_code}]:", resp.text)
-        resp.raise_for_status()
-
-    try:
-        data = resp.json()
-    except requests.exceptions.JSONDecodeError as exc:
-        raise RuntimeError("Backend returned a non-JSON success response.") from exc
-
-    print(f"[Success] Incident #{data.get('incident_id')} logged! Risk={data.get('diagnosis', {}).get('risk_level')}")
-    print(f"Root Cause: {data.get('diagnosis', {}).get('root_cause')}")
+    if resp.status_code == 200:
+        try:
+            data = resp.json()
+            print(f"[Success] Incident #{data.get('incident_id')} logged!")
+        except requests.exceptions.JSONDecodeError as exc:
+            raise RuntimeError(f"Backend returned non-JSON. Raw body was: {resp.text}") from exc
+    else:
+        raise RuntimeError(f"Backend failed with status {resp.status_code}: {resp.text}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SentinelOps Linux Diagnostic Log Collector Agent")
