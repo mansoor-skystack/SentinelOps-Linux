@@ -67,6 +67,17 @@ def process_incident(raw_log: str, stack_filter: str, hostname: str, source_type
         db.commit()
         db.refresh(rec)
         inc_id = rec.id
+
+        # Trigger autonomous notification dispatch
+        from .notifier import send_slack_alert
+        send_slack_alert(
+            incident_id=inc_id,
+            hostname=hostname,
+            stack=stack_filter,
+            root_cause=diagnosis.get("root_cause", ""),
+            risk_level=diagnosis.get("risk_level", "SAFE"),
+            fix_commands=diagnosis.get("fix_commands", [])
+        )
     finally:
         db.close()
 
