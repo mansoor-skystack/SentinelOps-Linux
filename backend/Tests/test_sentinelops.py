@@ -1,5 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
+from app import main
 from app.main import app
 from app.sanitizer import LogSanitizer
 from app.guardrails import CommandSafetyGuardrail
@@ -16,6 +17,41 @@ def test_health_endpoint(client):
     body = res.json()
     assert body["status"] == "online"
     assert body["indexed_chunks"] > 0
+
+
+def test_page_views_only_track_dashboard_requests(client, monkeypatch):
+    recorded = []
+    monkeypatch.setattr(
+        main,
+        "save_visitor_in_background",
+        lambda *args: recorded.append(args),
+    )
+    headers = {
+        "x-forwarded-for": "203.0.113.10, 10.0.0.1",
+        "user-agent": "SentinelOps test client",
+    }
+
+    home_response = client.get("/", headers=headers)
+    health_response = client.get("/api/health", headers=headers)
+
+    assert home_response.status_code == 200
+    assert health_response.status_code == 200
+    assert recorded == [
+        ("203.0.113.10", "SentinelOps test client", "Direct", "Unknown", "/")
+    ]
+
+
+def test_visitor_endpoint_requires_dedicated_key(client, monkeypatch):
+    monkeypatch.setattr(main, "VISITOR_API_KEY", "")
+    assert client.get("/api/visitors").status_code == 503
+
+    monkeypatch.setattr(main, "VISITOR_API_KEY", "test-visitor-key")
+    assert client.get("/api/visitors").status_code == 401
+    response = client.get(
+        "/api/visitors",
+        headers={"X-API-Key": "test-visitor-key"},
+    )
+    assert response.status_code == 200
 
 
 def test_pii_and_secret_sanitization():

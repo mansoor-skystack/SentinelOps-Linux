@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./sentinelops.db").strip()
@@ -31,5 +31,38 @@ class IncidentRecord(Base):
     citations = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class VisitorLog(Base):
+    __tablename__ = "visitor_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    ip_address = Column(String(64), index=True)
+    city = Column(String(100), default="Unknown")
+    region = Column(String(100), default="Unknown")
+    country = Column(String(100), default="Unknown")
+    isp = Column(String(150), default="Unknown")
+    browser_os = Column(String(200), default="Unknown")
+    referrer = Column(String(250), default="Direct")
+    accept_language = Column(String(100), default="Unknown")
+    path = Column(String(150), default="/")
+    visited_at = Column(DateTime, default=datetime.utcnow)
+
 def init_db():
     Base.metadata.create_all(bind=engine)
+    visitor_columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("visitor_logs")
+    }
+    additions = {
+        "city": "VARCHAR(100) DEFAULT 'Unknown'",
+        "region": "VARCHAR(100) DEFAULT 'Unknown'",
+        "country": "VARCHAR(100) DEFAULT 'Unknown'",
+        "isp": "VARCHAR(150) DEFAULT 'Unknown'",
+        "browser_os": "VARCHAR(200) DEFAULT 'Unknown'",
+        "referrer": "VARCHAR(250) DEFAULT 'Direct'",
+        "accept_language": "VARCHAR(100) DEFAULT 'Unknown'",
+    }
+    with engine.begin() as connection:
+        for name, definition in additions.items():
+            if name not in visitor_columns:
+                connection.execute(
+                    text(f"ALTER TABLE visitor_logs ADD COLUMN {name} {definition}")
+                )
