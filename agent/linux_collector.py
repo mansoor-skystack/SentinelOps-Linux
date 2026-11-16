@@ -11,12 +11,7 @@ import subprocess
 import argparse
 import time
 import requests
-
-BACKEND_URL = os.getenv("SENTINELOPS_URL") or os.getenv("SENTINELOPS_API_URL", "https://sentinelops-linux.onrender.com")
-API_ENDPOINT = BACKEND_URL.rstrip("/")
-if not API_ENDPOINT.endswith("/api/webhook/ingest"):
-    API_ENDPOINT = f"{API_ENDPOINT}/api/webhook/ingest"
-API_KEY = os.getenv("SENTINELOPS_API_KEY", "SentinelOps-webhook-secret-2026")
+from urllib.parse import urlsplit, urlunsplit
 
 SIMULATED_CRASHES = {
     "nginx": {
@@ -79,10 +74,34 @@ def collect_live_journal_errors() -> str:
             timeout=5
         )
         return out.strip()
-    except Exception as e:
-        return f"ERROR: Unable to read journalctl directly ({e}). Fallback telemetry check."
+    except (subprocess.SubprocessError, OSError, UnicodeError):
+        return "ERROR: Unable to read journalctl directly. Fallback telemetry check."
+
+def _webhook_config():
+    backend_url = (os.getenv("SENTINELOPS_URL") or os.getenv("SENTINELOPS_API_URL") or "").strip()
+    api_key = os.getenv("SENTINELOPS_API_KEY", "").strip()
+    if not backend_url or not api_key:
+        raise RuntimeError("SENTINELOPS_URL and SENTINELOPS_API_KEY must be configured")
+
+    parsed = urlsplit(backend_url)
+    if (
+        not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or (parsed.scheme != "https" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"})
+    ):
+        raise RuntimeError("SentinelOps webhook URL must use HTTPS and contain no credentials or query string")
+
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/api/webhook/ingest"):
+        path = f"{path}/api/webhook/ingest" if path else "/api/webhook/ingest"
+    endpoint = urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    return endpoint, api_key
 
 def ship_alert(raw_log: str, stack_tag: str = "Linux"):
+    api_endpoint, api_key = _webhook_config()
     hostname, cpu_load, mem_pct, disk_pct = collect_system_metrics()
     payload = {
         "hostname": hostname,
@@ -92,21 +111,23 @@ def ship_alert(raw_log: str, stack_tag: str = "Linux"):
         "disk_used_pct": disk_pct,
         "raw_log": raw_log
     }
-    headers = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
-    print(f"[SentinelOps Agent -> {BACKEND_URL}] Shipping telemetry from '{hostname}'...")
-    
-    resp = requests.post(API_ENDPOINT, json=payload, headers=headers)
-    print(f"Response Status: {resp.status_code}")
-    print(f"Response Body: {resp.text}")  # <-- This will print the actual error HTML/text from Render
+    headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
+    print(f"[SentinelOps Agent] Sending telemetry from '{hostname}'...")
 
-    if resp.status_code == 200:
-        try:
-            data = resp.json()
-            print(f"[Success] Incident #{data.get('incident_id')} logged!")
-        except requests.exceptions.JSONDecodeError as exc:
-            raise RuntimeError(f"Backend returned non-JSON. Raw body was: {resp.text}") from exc
-    else:
-        raise RuntimeError(f"Backend failed with status {resp.status_code}: {resp.text}")
+    try:
+        resp = requests.post(api_endpoint, json=payload, headers=headers, timeout=(3, 10))
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Webhook request failed ({type(exc).__name__})") from None
+
+    print(f"Response Status: {resp.status_code}")
+
+    if not resp.ok:
+        raise RuntimeError(f"Backend rejected telemetry (HTTP {resp.status_code})")
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError("Backend returned an invalid JSON response") from None
+    print(f"[Success] Incident #{data.get('incident_id')} logged!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SentinelOps Linux Diagnostic Log Collector Agent")

@@ -1,16 +1,15 @@
-import os
 import json
+import os
 import paramiko
 from typing import Dict, Any, List
 from .guardrails import CommandSafetyGuardrail
 
 
 class SSHRemediationEngine:
-    """Executes verified SAFE remediation commands on remote Linux hosts via SSH."""
+    """Runs only explicitly approved remediation commands on trusted SSH hosts."""
 
     @staticmethod
     def execute_fix(hostname: str, commands: List[str], risk_level: str) -> Dict[str, Any]:
-        # Hard guardrail check: refuse execution if flagged or not SAFE
         recheck_risk, flagged = CommandSafetyGuardrail.inspect(commands)
         if risk_level != "SAFE" or recheck_risk != "SAFE":
             return {
@@ -20,34 +19,95 @@ class SSHRemediationEngine:
                 "outputs": []
             }
 
-        ssh_user = os.getenv("TARGET_SSH_USER", "ubuntu").strip()
-        ssh_key_path = os.getenv("TARGET_SSH_KEY_PATH", "").strip()
-        ssh_password = os.getenv("TARGET_SSH_PASSWORD", "").strip()
-
-        # Simulation mode when no SSH credentials are configured in cloud env
-        if not ssh_key_path and not ssh_password:
+        if os.getenv("SSH_REMEDIATION_ENABLED", "").strip().lower() != "true":
             return {
-                "executed": True,
-                "status": "SIMULATED_EXECUTION",
+                "executed": False,
+                "status": "SIMULATION_ONLY",
                 "host": hostname,
                 "outputs": [
-                    {"command": cmd, "exit_code": 0, "stdout": f"[Simulated SSH on {hostname}] Executed: {cmd}"}
+                    {"command": cmd, "exit_code": None, "stdout": "Not executed; live SSH remediation is disabled."}
                     for cmd in commands
-                ]
+                ],
+            }
+
+        allowed_hosts = {
+            host.strip().lower()
+            for host in os.getenv("SSH_ALLOWED_HOSTS", "").split(",")
+            if host.strip()
+        }
+        target_host = hostname.strip()
+        if not target_host or target_host != hostname or target_host.lower() not in allowed_hosts:
+            return {
+                "executed": False,
+                "status": "BLOCKED_HOST",
+                "reason": "Host is not in SSH_ALLOWED_HOSTS.",
+                "outputs": [],
+            }
+
+        try:
+            configured_commands = json.loads(os.getenv("SSH_ALLOWED_COMMANDS", "[]"))
+        except ValueError:
+            configured_commands = None
+        if not isinstance(configured_commands, list) or any(
+            not isinstance(command, str) for command in configured_commands
+        ):
+            return {
+                "executed": False,
+                "status": "BLOCKED_CONFIGURATION",
+                "reason": "SSH_ALLOWED_COMMANDS must be a JSON array of exact command strings.",
+                "outputs": [],
+            }
+        allowed_commands = {command.strip() for command in configured_commands if command.strip()}
+        if not commands or any(command not in allowed_commands for command in commands):
+            return {
+                "executed": False,
+                "status": "BLOCKED_COMMAND",
+                "reason": "Every command must exactly match an entry in SSH_ALLOWED_COMMANDS.",
+                "outputs": [],
+            }
+
+        ssh_user = os.getenv("TARGET_SSH_USER", "").strip()
+        ssh_key_path = os.getenv("TARGET_SSH_KEY_PATH", "").strip()
+        known_hosts_path = os.getenv("SSH_KNOWN_HOSTS", "").strip()
+
+        if (
+            not ssh_user
+            or not ssh_key_path
+            or not known_hosts_path
+            or not os.path.isfile(ssh_key_path)
+            or not os.path.isfile(known_hosts_path)
+        ):
+            return {
+                "executed": False,
+                "status": "BLOCKED_CONFIGURATION",
+                "reason": "A user, private key file, and known-hosts file are required.",
+                "outputs": [],
             }
 
         client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.load_host_keys(known_hosts_path)
+        except (OSError, paramiko.SSHException):
+            return {
+                "executed": False,
+                "status": "BLOCKED_CONFIGURATION",
+                "reason": "The configured known-hosts file could not be loaded.",
+                "outputs": [],
+            }
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
         results = []
 
         try:
-            connect_kwargs = {"hostname": hostname, "username": ssh_user, "timeout": 10}
-            if ssh_key_path and os.path.exists(ssh_key_path):
-                connect_kwargs["key_filename"] = ssh_key_path
-            else:
-                connect_kwargs["password"] = ssh_password
-
-            client.connect(**connect_kwargs)
+            client.connect(
+                hostname=target_host,
+                username=ssh_user,
+                key_filename=ssh_key_path,
+                timeout=10,
+                banner_timeout=10,
+                auth_timeout=10,
+                allow_agent=False,
+                look_for_keys=False,
+            )
 
             for cmd in commands:
                 _, stdout, stderr = client.exec_command(cmd, timeout=15)
@@ -55,8 +115,8 @@ class SSHRemediationEngine:
                 results.append({
                     "command": cmd,
                     "exit_code": exit_code,
-                    "stdout": stdout.read().decode("utf-8", errors="ignore").strip(),
-                    "stderr": stderr.read().decode("utf-8", errors="ignore").strip()
+                    "stdout": stdout.read(4097).decode("utf-8", errors="replace").strip()[:4096],
+                    "stderr": stderr.read(4097).decode("utf-8", errors="replace").strip()[:4096],
                 })
 
             return {
@@ -65,11 +125,11 @@ class SSHRemediationEngine:
                 "host": hostname,
                 "outputs": results
             }
-        except Exception as exc:
+        except (paramiko.SSHException, OSError, EOFError) as exc:
             return {
                 "executed": False,
                 "status": "SSH_CONNECTION_ERROR",
-                "reason": str(exc),
+                "reason": f"SSH operation failed ({type(exc).__name__}).",
                 "outputs": results
             }
         finally:

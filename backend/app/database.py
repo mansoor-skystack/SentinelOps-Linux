@@ -1,6 +1,7 @@
 import os
 from datetime import datetime
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, inspect, text
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./sentinelops.db").strip()
@@ -9,8 +10,25 @@ if DATABASE_URL.startswith("postgres://"):
 elif DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
+def _enforce_remote_postgres_tls(database_url: URL) -> URL:
+    if not database_url.drivername.startswith("postgresql") or database_url.host in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }:
+        return database_url
+
+    query = dict(database_url.query)
+    sslmode = query.get("sslmode", "")
+    if not isinstance(sslmode, str) or sslmode.lower() not in {"require", "verify-ca", "verify-full"}:
+        query["sslmode"] = "require"
+    return database_url.set(query=query)
+
+
+database_url = _enforce_remote_postgres_tls(make_url(DATABASE_URL))
+
+connect_args = {"check_same_thread": False} if database_url.drivername.startswith("sqlite") else {}
+engine = create_engine(database_url, connect_args=connect_args, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

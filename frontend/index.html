@@ -4,10 +4,10 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SentinelOps | Enterprise AIOps & Linux Copilot</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.1.11" integrity="sha384-A1XhMANHciQ8ED89Ap5K0zOdmQKiEeXSjaN0sakNxIzq9Z2YfXV/BwHp7oP3z5ip" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.26.10/babel.min.js" integrity="sha384-BcI7nduYchENm39cFMEVJXHEE7fwHONANyn/pY2YTa+BNtrWF2bKBZeI0wqVithi" crossorigin="anonymous"></script>
 </head>
 <body class="bg-[#080b12] text-slate-100 min-h-screen font-sans antialiased selection:bg-blue-500 selection:text-white">
   <div id="root"></div>
@@ -24,7 +24,7 @@
       {
         label: "Linux Kernel OOM-Killer (Exit Code 137)",
         stack: "Linux",
-        log: "DEBUG: GC pause 140ms\nkernel: [48219.112] Out of memory: Killed process 2194 (java) total-vm:2412904kB, anon-rss:912400kB\nDATABASE_URL=postgresql://admin:SuperSecretPass99@10.0.1.50:5432/prod"
+        log: "DEBUG: GC pause 140ms\nkernel: [48219.112] Out of memory: Killed process 2194 (java) total-vm:2412904kB, anon-rss:912400kB\nDATABASE_URL=postgresql://user:<REDACTED>@db.example.invalid:5432/app"
       },
       {
         label: "Disk Exhaustion (/var/log ENOSPC)",
@@ -49,19 +49,89 @@
       const [errorMsg, setErrorMsg] = useState(null);
       const [filterTag, setFilterTag] = useState("All");
       const [activeTab, setActiveTab] = useState("alerts");
+      const [authState, setAuthState] = useState({ checking: true, configured: true, authenticated: false });
+      const [loginPassword, setLoginPassword] = useState("");
+      const [loginError, setLoginError] = useState("");
 
       const fetchIncidents = async () => {
         try {
           const res = await fetch("/api/incidents?limit=15");
-          if (res.ok) setIncidents(await res.json());
-        } catch (e) {}
+          if (res.status === 401) {
+            setLoginError("Admin session expired. Sign in again.");
+            setAuthState((current) => ({ ...current, authenticated: false }));
+            setIncidents([]);
+            return;
+          }
+          if (!res.ok) throw new Error(`Unable to load incidents (HTTP ${res.status})`);
+          setIncidents(await res.json());
+        } catch (error) {
+          setErrorMsg(error.message);
+        }
       };
 
       useEffect(() => {
+        let active = true;
+        fetch("/api/auth/status", { credentials: "same-origin", cache: "no-store" })
+          .then(async (res) => {
+            if (!res.ok) throw new Error(`Unable to check admin session (HTTP ${res.status})`);
+            return res.json();
+          })
+          .then((status) => {
+            if (active) {
+              setAuthState({ checking: false, configured: status.configured, authenticated: status.authenticated });
+            }
+          })
+          .catch(() => {
+            if (active) {
+              setLoginError("Unable to contact the admin service. Reload the page and retry.");
+              setAuthState({ checking: false, configured: false, authenticated: false });
+            }
+          });
+        return () => { active = false; };
+      }, []);
+
+      useEffect(() => {
+        if (!authState.authenticated) {
+          setIncidents([]);
+          return;
+        }
         fetchIncidents();
         const timer = setInterval(fetchIncidents, 10000);
         return () => clearInterval(timer);
-      }, []);
+      }, [authState.authenticated]);
+
+      const handleLogin = async (event) => {
+        event.preventDefault();
+        setLoginError("");
+        try {
+          const res = await fetch("/api/auth/login", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password: loginPassword })
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Unable to sign in");
+          setLoginPassword("");
+          setAuthState({ checking: false, configured: true, authenticated: true });
+        } catch (error) {
+          setLoginError(error.message);
+        }
+      };
+
+      const handleLogout = async () => {
+        try {
+          const res = await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
+          if (!res.ok) throw new Error(`Unable to sign out (HTTP ${res.status})`);
+        } catch (error) {
+          setErrorMsg(error.message);
+        } finally {
+          setLoginError(error.message);
+          setAuthState({ checking: false, configured: true, authenticated: false });
+          setIncidents([]);
+          setResult(null);
+        }
+      };
 
       const runDiagnosis = async (sourceType = "manual") => {
         if (!rawLog.trim()) return;
@@ -70,6 +140,7 @@
         try {
           const res = await fetch("/api/diagnose", {
             method: "POST",
+            credentials: "same-origin",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               raw_log: rawLog,
@@ -79,6 +150,10 @@
             })
           });
           const data = await res.json();
+          if (res.status === 401) {
+            setLoginError("Admin session expired. Sign in again.");
+            setAuthState((current) => ({ ...current, authenticated: false }));
+          }
           if (!res.ok) {
             throw new Error(data.detail || JSON.stringify(data) || "Server error");
           }
@@ -104,6 +179,51 @@
       };
 
       const filteredIncidents = incidents.filter(inc => filterTag === "All" || inc.stack_tag === filterTag);
+
+      if (authState.checking) {
+        return <div className="flex min-h-screen items-center justify-center bg-[#080b12] text-sm text-slate-300">Checking admin session...</div>;
+      }
+
+      if (!authState.configured) {
+        return (
+          <div className="flex min-h-screen items-center justify-center bg-[#080b12] p-5 text-slate-100">
+            <section className="w-full max-w-md rounded-2xl border border-slate-800 bg-[#111722] p-7 shadow-2xl">
+              <h1 className="text-xl font-semibold">Admin login unavailable</h1>
+              <p className="mt-3 text-sm text-slate-400">{loginError || "Configure a strong ADMIN_PASSWORD and a random SESSION_SECRET of at least 32 characters on the server."}</p>
+            </section>
+          </div>
+        );
+      }
+
+      if (!authState.authenticated) {
+        return (
+          <div className="flex min-h-screen items-center justify-center bg-[#080b12] p-5 text-slate-100">
+            <section className="w-full max-w-md rounded-2xl border border-slate-800 bg-[#111722] p-7 shadow-2xl">
+              <div className="mb-6 flex items-center gap-3">
+                <span className="flex h-9 w-9 items-center justify-center rounded-lg border border-blue-300/30 bg-blue-400/15 text-lg text-blue-200">∿</span>
+                <div>
+                  <h1 className="text-lg font-semibold">SentinelOps</h1>
+                  <p className="text-xs text-slate-400">Admin sign in</p>
+                </div>
+              </div>
+              <form onSubmit={handleLogin} className="space-y-4">
+                <label htmlFor="admin-password" className="block text-xs font-medium text-slate-300">Admin password</label>
+                <input
+                  id="admin-password"
+                  type="password"
+                  autoComplete="current-password"
+                  required
+                  value={loginPassword}
+                  onChange={(event) => setLoginPassword(event.target.value)}
+                  className="w-full rounded-xl border border-slate-700 bg-[#0a111c] px-4 py-3 text-sm text-slate-100 focus:border-blue-500 focus:outline-none"
+                />
+                {loginError && <p role="alert" className="text-sm text-red-300">{loginError}</p>}
+                <button type="submit" className="w-full rounded-xl bg-blue-600 px-4 py-3 text-sm font-medium text-white transition hover:bg-blue-500">Sign in</button>
+              </form>
+            </section>
+          </div>
+        );
+      }
 
       return (
         <div
@@ -156,6 +276,9 @@
                       ↓ &nbsp; Export
                     </a>
                   )}
+                  <button onClick={handleLogout} className="rounded-full border border-slate-700 bg-[#111824] px-3.5 py-2 text-xs text-slate-300 transition hover:bg-slate-800">
+                    Sign out
+                  </button>
                 </div>
               </header>
 

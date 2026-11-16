@@ -3,28 +3,61 @@ import json
 import hmac
 import ipaddress
 import logging
+import re
 from typing import Optional
 import requests
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, BackgroundTasks
+from urllib.parse import urlsplit
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, BackgroundTasks, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 load_dotenv()
 
+from . import auth
 from .database import init_db, SessionLocal, IncidentRecord, VisitorLog
 from .sanitizer import LogSanitizer
 from .retriever import HybridKnowledgeEngine, RUNBOOKS_DIR
 from .llm import synthesize_diagnosis
 
-SENTINELOPS_API_KEY = os.getenv("SENTINELOPS_API_KEY", "SentinelOps-webhook-secret-2026")
-VISITOR_API_KEY = os.getenv("VISITOR_API_KEY", "").strip()
+SENTINELOPS_API_KEY = os.getenv("SENTINELOPS_API_KEY", "").strip()
 logger = logging.getLogger(__name__)
 FRONTEND_HTML = os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "index.html")
+MAX_RUNBOOK_BYTES = 1_000_000
 
 app = FastAPI(title="SentinelOps: Automated Linux Log Telemetry & Hybrid-RAG System")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+def _parse_cors_origins(configured_origins: str) -> list[str]:
+    origins = []
+    for configured in configured_origins.split(","):
+        origin = configured.strip().rstrip("/")
+        if not origin:
+            continue
+        parsed = urlsplit(origin)
+        hostname = (parsed.hostname or "").lower()
+        if (
+            not hostname
+            or parsed.username
+            or parsed.password
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or (parsed.scheme != "https" and hostname not in {"localhost", "127.0.0.1", "::1"})
+        ):
+            raise ValueError("CORS_ALLOWED_ORIGINS must contain exact HTTPS origins (HTTP is allowed for localhost)")
+        origins.append(f"{parsed.scheme}://{parsed.netloc}")
+    return origins
+
+
+cors_origins = _parse_cors_origins(os.getenv("CORS_ALLOWED_ORIGINS", ""))
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
+)
 
 def parse_device_summary(user_agent: str) -> str:
     lowered_ua = user_agent.lower()
@@ -149,18 +182,21 @@ def on_startup():
     rag_engine = HybridKnowledgeEngine()
 
 class TriageRequest(BaseModel):
-    raw_log: str
-    stack_filter: str = "All"
-    hostname: str = "web-console"
-    source_type: str = "manual"
+    raw_log: str = Field(..., max_length=100_000)
+    stack_filter: str = Field(default="All", max_length=50)
+    hostname: str = Field(default="web-console", max_length=120)
+    source_type: str = Field(default="manual", max_length=50)
 
 class AgentWebhookPayload(BaseModel):
-    hostname: str
-    stack_tag: str = "Linux"
+    hostname: str = Field(..., max_length=120)
+    stack_tag: str = Field(default="Linux", max_length=50)
     cpu_load: float = 0.0
     mem_used_pct: float = 0.0
     disk_used_pct: float = 0.0
-    raw_log: str
+    raw_log: str = Field(..., max_length=100_000)
+
+class AdminLoginRequest(BaseModel):
+    password: str = Field(..., min_length=1, max_length=256)
 
 def process_incident(raw_log: str, stack_filter: str, hostname: str, source_type: str, cpu: float = 0.0, mem: float = 0.0, disk: float = 0.0):
     sanitized, redactions, dropped = LogSanitizer.filter_and_sanitize(raw_log)
@@ -220,16 +256,56 @@ def serve_dashboard():
 def health_check():
     return {"status": "online", "app": "SentinelOps", "indexed_chunks": len(rag_engine.documents) if rag_engine else 0}
 
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    return {
+        "configured": auth.auth_is_configured(),
+        "authenticated": auth.has_admin_session(request),
+    }
+
+@app.post("/api/auth/login")
+def admin_login(req: AdminLoginRequest):
+    if not auth.auth_is_configured():
+        raise HTTPException(status_code=503, detail="Admin authentication is not configured")
+    if not auth.verify_admin_password(req.password):
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+
+    response = JSONResponse({"authenticated": True})
+    response.set_cookie(
+        key=auth.SESSION_COOKIE_NAME,
+        value=auth.create_session_token(),
+        max_age=auth.SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=auth.SESSION_COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+    return response
+
+@app.post("/api/auth/logout")
+def admin_logout():
+    response = JSONResponse({"authenticated": False})
+    response.delete_cookie(
+        key=auth.SESSION_COOKIE_NAME,
+        httponly=True,
+        secure=auth.SESSION_COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+    return response
+
 @app.post("/api/diagnose")
-def diagnose_manual(req: TriageRequest):
+def diagnose_manual(req: TriageRequest, _: None = Depends(auth.require_admin)):
     if not req.raw_log.strip():
         raise HTTPException(status_code=400, detail="Error log cannot be empty")
     return process_incident(req.raw_log, req.stack_filter, req.hostname, req.source_type)
 
 @app.post("/api/webhook/ingest")
 def ingest_from_linux_agent(payload: AgentWebhookPayload, x_api_key: Optional[str] = Header(None)):
-    if x_api_key != SENTINELOPS_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized SentinelOps Agent API Key")
+    if not SENTINELOPS_API_KEY:
+        raise HTTPException(status_code=503, detail="Agent webhook authentication is not configured")
+    if not x_api_key or not hmac.compare_digest(x_api_key, SENTINELOPS_API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized agent API key")
     return process_incident(
         payload.raw_log,
         payload.stack_tag,
@@ -241,7 +317,7 @@ def ingest_from_linux_agent(payload: AgentWebhookPayload, x_api_key: Optional[st
     )
 
 @app.get("/api/incidents")
-def list_recent_incidents(limit: int = 10):
+def list_recent_incidents(limit: int = Query(default=10, ge=1, le=50), _: None = Depends(auth.require_admin)):
     db = SessionLocal()
     try:
         rows = db.query(IncidentRecord).order_by(IncidentRecord.id.desc()).limit(limit).all()
@@ -268,17 +344,24 @@ def list_recent_incidents(limit: int = 10):
         db.close()
 
 @app.post("/api/runbooks/upload")
-async def upload_runbook(file: UploadFile = File(...)):
-    if not file.filename.endswith(".md"):
+async def upload_runbook(file: UploadFile = File(...), _: None = Depends(auth.require_admin)):
+    filename = file.filename or ""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.md", filename, re.IGNORECASE):
         raise HTTPException(status_code=400, detail="Only Markdown (.md) runbooks allowed")
-    dest = os.path.join(RUNBOOKS_DIR, os.path.basename(file.filename))
+
+    contents = await file.read(MAX_RUNBOOK_BYTES + 1)
+    await file.close()
+    if len(contents) > MAX_RUNBOOK_BYTES:
+        raise HTTPException(status_code=413, detail="Runbook exceeds the 1 MB upload limit")
+
+    dest = os.path.join(RUNBOOKS_DIR, filename)
     with open(dest, "wb") as f:
-        f.write(await file.read())
+        f.write(contents)
     rag_engine.rebuild_index()
-    return {"status": "indexed", "filename": file.filename, "total_chunks": len(rag_engine.documents)}
+    return {"status": "indexed", "filename": filename, "total_chunks": len(rag_engine.documents)}
 
 @app.get("/api/export/{incident_id}", response_class=PlainTextResponse)
-def export_postmortem(incident_id: int):
+def export_postmortem(incident_id: int, _: None = Depends(auth.require_admin)):
     db = SessionLocal()
     try:
         r = db.query(IncidentRecord).filter(IncidentRecord.id == incident_id).first()
@@ -321,7 +404,7 @@ def export_postmortem(incident_id: int):
 from .remediator import SSHRemediationEngine
 
 @app.post("/api/remediate/{incident_id}")
-def approve_and_remediate(incident_id: int):
+def approve_and_remediate(incident_id: int, _: None = Depends(auth.require_admin)):
     db = SessionLocal()
     try:
         rec = db.query(IncidentRecord).filter(IncidentRecord.id == incident_id).first()
@@ -346,12 +429,7 @@ def approve_and_remediate(incident_id: int):
         db.close()
 
 @app.get("/api/visitors")
-def list_visitors(x_api_key: Optional[str] = Header(None)):
-    if not VISITOR_API_KEY:
-        raise HTTPException(status_code=503, detail="Visitor API is not configured")
-    if not x_api_key or not hmac.compare_digest(x_api_key, VISITOR_API_KEY):
-        raise HTTPException(status_code=401, detail="Unauthorized visitor API key")
-
+def list_visitors(_: None = Depends(auth.require_admin)):
     db = SessionLocal()
     try:
         rows = db.query(VisitorLog).order_by(VisitorLog.visited_at.desc()).limit(50).all()
