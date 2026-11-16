@@ -1,7 +1,11 @@
 import os
 import json
+import hmac
+import ipaddress
+import logging
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File
+import requests
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -9,16 +13,132 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from .database import init_db, SessionLocal, IncidentRecord
+from .database import init_db, SessionLocal, IncidentRecord, VisitorLog
 from .sanitizer import LogSanitizer
 from .retriever import HybridKnowledgeEngine, RUNBOOKS_DIR
 from .llm import synthesize_diagnosis
 
 SENTINELOPS_API_KEY = os.getenv("SENTINELOPS_API_KEY", "SentinelOps-webhook-secret-2026")
+VISITOR_API_KEY = os.getenv("VISITOR_API_KEY", "").strip()
+logger = logging.getLogger(__name__)
 FRONTEND_HTML = os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "index.html")
 
 app = FastAPI(title="SentinelOps: Automated Linux Log Telemetry & Hybrid-RAG System")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+def parse_device_summary(user_agent: str) -> str:
+    lowered_ua = user_agent.lower()
+    if "windows" in lowered_ua:
+        os_name = "Windows"
+    elif "android" in lowered_ua:
+        os_name = "Android"
+    elif "iphone" in lowered_ua or "ipad" in lowered_ua:
+        os_name = "iOS"
+    elif "mac os" in lowered_ua:
+        os_name = "macOS"
+    elif "linux" in lowered_ua:
+        os_name = "Linux"
+    else:
+        os_name = "Unknown OS"
+
+    if "edg/" in lowered_ua:
+        browser = "Edge"
+    elif "chrome/" in lowered_ua:
+        browser = "Chrome"
+    elif "firefox/" in lowered_ua:
+        browser = "Firefox"
+    elif "safari/" in lowered_ua and "chrome/" not in lowered_ua:
+        browser = "Safari"
+    elif "curl" in lowered_ua or "python-requests" in lowered_ua:
+        browser = "CLI / Bot"
+    else:
+        browser = "Unknown Browser"
+
+    return f"{browser} on {os_name} | Raw: {user_agent[:120]}"
+
+def _lookup_visitor_location(ip_address: str) -> tuple[str, str, str, str]:
+    try:
+        address = ipaddress.ip_address(ip_address)
+    except ValueError:
+        logger.warning("Skipping visitor geolocation for an invalid IP address")
+        return "Unknown", "Unknown", "Unknown", "Unknown"
+
+    if not address.is_global:
+        return "Unknown", "Unknown", "Unknown", "Unknown"
+
+    try:
+        response = requests.get(
+            f"https://ipapi.co/{address.compressed}/json/",
+            timeout=3,
+        )
+        response.raise_for_status()
+        geo = response.json()
+        if not isinstance(geo, dict) or geo.get("error"):
+            raise ValueError("Geolocation provider returned an invalid response")
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("Visitor geolocation lookup failed (%s)", type(exc).__name__)
+        return "Unknown", "Unknown", "Unknown", "Unknown"
+
+    return (
+        str(geo.get("city") or "Unknown")[:100],
+        str(geo.get("region") or "Unknown")[:100],
+        str(geo.get("country_name") or "Unknown")[:100],
+        str(geo.get("org") or "Unknown")[:150],
+    )
+
+def save_visitor_in_background(
+    ip_address: str,
+    user_agent: str,
+    referrer: str,
+    accept_language: str,
+    path: str,
+) -> None:
+    city, region, country, isp = _lookup_visitor_location(ip_address)
+    with SessionLocal() as db:
+        db.add(
+            VisitorLog(
+                ip_address=ip_address[:64],
+                city=city,
+                region=region,
+                country=country,
+                isp=isp,
+                browser_os=parse_device_summary(user_agent)[:200],
+                referrer=referrer[:250],
+                accept_language=accept_language[:100],
+                path=path[:150],
+            )
+        )
+        db.commit()
+
+@app.middleware("http")
+async def capture_passive_visitors(request: Request, call_next):
+    response = await call_next(request)
+
+    if request.method == "GET" and request.url.path == "/":
+        forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+        client_host = request.client.host if request.client else "Unknown"
+        real_ip = forwarded or client_host
+        user_agent = request.headers.get("user-agent", "Unknown")
+        referrer = request.headers.get("referer", "Direct")
+        accept_language = request.headers.get("accept-language", "Unknown")
+
+        if response.background is None:
+            response.background = BackgroundTasks()
+        elif not isinstance(response.background, BackgroundTasks):
+            existing_background = response.background
+            response.background = BackgroundTasks()
+            response.background.add_task(existing_background)
+
+        response.background.add_task(
+            save_visitor_in_background,
+            real_ip,
+            user_agent,
+            referrer,
+            accept_language,
+            request.url.path,
+        )
+
+    return response
 
 rag_engine: Optional[HybridKnowledgeEngine] = None
 
@@ -222,5 +342,31 @@ def approve_and_remediate(incident_id: int):
             "hostname": rec.hostname,
             "remediation": execution_report
         }
+    finally:
+        db.close()
+
+@app.get("/api/visitors")
+def list_visitors(x_api_key: Optional[str] = Header(None)):
+    if not VISITOR_API_KEY:
+        raise HTTPException(status_code=503, detail="Visitor API is not configured")
+    if not x_api_key or not hmac.compare_digest(x_api_key, VISITOR_API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized visitor API key")
+
+    db = SessionLocal()
+    try:
+        rows = db.query(VisitorLog).order_by(VisitorLog.visited_at.desc()).limit(50).all()
+        return [
+            {
+                "id": row.id,
+                "ip_address": row.ip_address,
+                "location": f"{row.city}, {row.region}, {row.country}",
+                "isp": row.isp,
+                "device": row.browser_os,
+                "referrer": row.referrer,
+                "language": row.accept_language,
+                "visited_at": row.visited_at.isoformat() if row.visited_at else None,
+            }
+            for row in rows
+        ]
     finally:
         db.close()

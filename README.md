@@ -5,6 +5,7 @@ Automated Linux Log Telemetry, PII/Secret Sanitization, and Hybrid-RAG Incident 
 ## VS Code Quickstart
 1. Extract this archive and double-click **`SentinelOps-Linux.code-workspace`** in **VS Code** (or run `code SentinelOps-Linux/SentinelOps-Linux.code-workspace`).
 2. Copy **`.env.example`** to **`.env`** and paste your free **`GROQ_API_KEY`** (created under API Key name **`SentinelOps`** at `console.groq.com`) and your **`DATABASE_URL`** from `neon.tech`.
+   Set a separate, strong **`VISITOR_API_KEY`** in your local `.env` and Render environment to access `GET /api/visitors`; send it in the `X-API-Key` header. Public visitor IPs are looked up over HTTPS with ipapi.co, so disclose this processing and set an appropriate data-retention policy.
 3. Open the VS Code terminal (`Ctrl + ~`) and run:
    ```bash
    python -m venv venv
