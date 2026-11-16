@@ -1,0 +1,20 @@
+# do-release-upgrade
+
+> The Ubuntu release upgrader.
+> More information: <https://manned.org/do-release-upgrade>.
+
+- Upgrade to the latest release:
+
+`sudo do-release-upgrade`
+
+- Upgrade to the latest development release:
+
+`sudo do-release-upgrade {{[-d|--devel-release]}}`
+
+- Upgrade to the latest proposed release:
+
+`sudo do-release-upgrade {{[-p|--proposed]}}`
+
+- Check if a new distribution release is available, without actually updating to it:
+
+`do-release-upgrade {{[-c|--check-dist-upgrade-only]}}`
