@@ -4,7 +4,7 @@ import hmac
 import ipaddress
 import logging
 import re
-from typing import Optional
+from typing import Dict, Literal, Optional
 import requests
 from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, BackgroundTasks, Depends, Query
@@ -20,6 +20,7 @@ from .database import init_db, SessionLocal, IncidentRecord, VisitorLog
 from .sanitizer import LogSanitizer
 from .retriever import HybridKnowledgeEngine, RUNBOOKS_DIR
 from .llm import synthesize_diagnosis
+from .notifier import send_slack_alert
 
 SENTINELOPS_API_KEY = os.getenv("SENTINELOPS_API_KEY", "").strip()
 logger = logging.getLogger(__name__)
@@ -126,8 +127,25 @@ def save_visitor_in_background(
     accept_language: str,
     path: str,
 ) -> None:
-    city, region, country, isp = _lookup_visitor_location(ip_address)
     with SessionLocal() as db:
+        cached_location = (
+            db.query(VisitorLog)
+            .filter(
+                VisitorLog.ip_address == ip_address,
+                VisitorLog.country != "Unknown",
+            )
+            .order_by(VisitorLog.visited_at.desc())
+            .first()
+        )
+        if cached_location:
+            city, region, country, isp = (
+                cached_location.city,
+                cached_location.region,
+                cached_location.country,
+                cached_location.isp,
+            )
+        else:
+            city, region, country, isp = _lookup_visitor_location(ip_address)
         db.add(
             VisitorLog(
                 ip_address=ip_address[:64],
@@ -198,10 +216,29 @@ class AgentWebhookPayload(BaseModel):
 class AdminLoginRequest(BaseModel):
     password: str = Field(..., min_length=1, max_length=256)
 
-def process_incident(raw_log: str, stack_filter: str, hostname: str, source_type: str, cpu: float = 0.0, mem: float = 0.0, disk: float = 0.0):
+class IncidentStatusUpdate(BaseModel):
+    status: Literal["PENDING", "COMPLETED"]
+
+class RemediationApproval(BaseModel):
+    approved: Literal[True]
+
+def process_incident(
+    raw_log: str,
+    stack_filter: str,
+    hostname: str,
+    source_type: str,
+    cpu: float = 0.0,
+    mem: float = 0.0,
+    disk: float = 0.0,
+    background_tasks: Optional[BackgroundTasks] = None,
+    telemetry: Optional[Dict[str, float]] = None,
+):
     sanitized, redactions, dropped = LogSanitizer.filter_and_sanitize(raw_log)
     chunks = rag_engine.search_hybrid(sanitized, stack_filter=stack_filter, top_k=3)
-    diagnosis = synthesize_diagnosis(sanitized, chunks)
+    try:
+        diagnosis = synthesize_diagnosis(sanitized, chunks, telemetry=telemetry)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     db = SessionLocal()
     try:
@@ -224,16 +261,18 @@ def process_incident(raw_log: str, stack_filter: str, hostname: str, source_type
         db.refresh(rec)
         inc_id = rec.id
 
-        # Trigger autonomous notification dispatch
-        from .notifier import send_slack_alert
-        send_slack_alert(
-            incident_id=inc_id,
-            hostname=hostname,
-            stack=stack_filter,
-            root_cause=diagnosis.get("root_cause", ""),
-            risk_level=diagnosis.get("risk_level", "SAFE"),
-            fix_commands=diagnosis.get("fix_commands", [])
-        )
+        alert_args = {
+            "incident_id": inc_id,
+            "hostname": hostname,
+            "stack": stack_filter,
+            "root_cause": diagnosis.get("root_cause", ""),
+            "risk_level": diagnosis.get("risk_level", "SAFE"),
+            "fix_commands": diagnosis.get("fix_commands", []),
+        }
+        if background_tasks is None:
+            send_slack_alert(**alert_args)
+        else:
+            background_tasks.add_task(send_slack_alert, **alert_args)
     finally:
         db.close()
 
@@ -264,11 +303,16 @@ def auth_status(request: Request):
     }
 
 @app.post("/api/auth/login")
-def admin_login(req: AdminLoginRequest):
+def admin_login(req: AdminLoginRequest, request: Request):
     if not auth.auth_is_configured():
         raise HTTPException(status_code=503, detail="Admin authentication is not configured")
+    client_ip = request.client.host if request.client else "unknown"
+    if auth.is_login_rate_limited(client_ip):
+        raise HTTPException(status_code=429, detail="Too many failed sign-in attempts. Try again later.")
     if not auth.verify_admin_password(req.password):
+        auth.record_failed_login(client_ip)
         raise HTTPException(status_code=401, detail="Invalid admin password")
+    auth.clear_failed_logins(client_ip)
 
     response = JSONResponse({"authenticated": True})
     response.set_cookie(
@@ -295,13 +339,24 @@ def admin_logout():
     return response
 
 @app.post("/api/diagnose")
-def diagnose_manual(req: TriageRequest, _: None = Depends(auth.require_admin)):
+def diagnose_manual(
+    req: TriageRequest,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(auth.require_admin),
+):
     if not req.raw_log.strip():
         raise HTTPException(status_code=400, detail="Error log cannot be empty")
-    return process_incident(req.raw_log, req.stack_filter, req.hostname, req.source_type)
+    return process_incident(
+        req.raw_log, req.stack_filter, req.hostname, req.source_type,
+        background_tasks=background_tasks,
+    )
 
 @app.post("/api/webhook/ingest")
-def ingest_from_linux_agent(payload: AgentWebhookPayload, x_api_key: Optional[str] = Header(None)):
+def ingest_from_linux_agent(
+    payload: AgentWebhookPayload,
+    background_tasks: BackgroundTasks,
+    x_api_key: Optional[str] = Header(None),
+):
     if not SENTINELOPS_API_KEY:
         raise HTTPException(status_code=503, detail="Agent webhook authentication is not configured")
     if not x_api_key or not hmac.compare_digest(x_api_key, SENTINELOPS_API_KEY):
@@ -314,13 +369,29 @@ def ingest_from_linux_agent(payload: AgentWebhookPayload, x_api_key: Optional[st
         payload.cpu_load,
         payload.mem_used_pct,
         payload.disk_used_pct,
+        background_tasks=background_tasks,
+        telemetry={
+            "cpu_load": payload.cpu_load,
+            "mem_used_pct": payload.mem_used_pct,
+            "disk_used_pct": payload.disk_used_pct,
+        },
     )
 
 @app.get("/api/incidents")
-def list_recent_incidents(limit: int = Query(default=10, ge=1, le=50), _: None = Depends(auth.require_admin)):
+def list_recent_incidents(
+    limit: Optional[int] = Query(default=None, ge=1),
+    source_type: Optional[str] = Query(default=None, max_length=50),
+    _: None = Depends(auth.require_admin),
+):
     db = SessionLocal()
     try:
-        rows = db.query(IncidentRecord).order_by(IncidentRecord.id.desc()).limit(limit).all()
+        query = db.query(IncidentRecord)
+        if source_type:
+            query = query.filter(IncidentRecord.source_type == source_type)
+        query = query.order_by(IncidentRecord.id.desc())
+        if limit is not None:
+            query = query.limit(limit)
+        rows = query.all()
         return [
             {
                 "id": r.id,
@@ -335,11 +406,29 @@ def list_recent_incidents(limit: int = Query(default=10, ge=1, le=50), _: None =
                 "diagnostic_commands": json.loads(r.diagnostic_commands or "[]"),
                 "fix_commands": json.loads(r.fix_commands or "[]"),
                 "risk_level": r.risk_level,
+                "status": r.status,
                 "citations": json.loads(r.citations or "[]"),
                 "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
             }
             for r in rows
         ]
+    finally:
+        db.close()
+
+@app.post("/api/incidents/{incident_id}/status")
+def update_incident_status(
+    incident_id: int,
+    update: IncidentStatusUpdate,
+    _: None = Depends(auth.require_admin),
+):
+    db = SessionLocal()
+    try:
+        incident = db.query(IncidentRecord).filter(IncidentRecord.id == incident_id).first()
+        if not incident:
+            raise HTTPException(status_code=404, detail="Incident not found")
+        incident.status = update.status
+        db.commit()
+        return {"incident_id": incident.id, "status": incident.status}
     finally:
         db.close()
 
@@ -404,7 +493,11 @@ def export_postmortem(incident_id: int, _: None = Depends(auth.require_admin)):
 from .remediator import SSHRemediationEngine
 
 @app.post("/api/remediate/{incident_id}")
-def approve_and_remediate(incident_id: int, _: None = Depends(auth.require_admin)):
+def approve_and_remediate(
+    incident_id: int,
+    approval: RemediationApproval,
+    _: None = Depends(auth.require_admin),
+):
     db = SessionLocal()
     try:
         rec = db.query(IncidentRecord).filter(IncidentRecord.id == incident_id).first()

@@ -37,7 +37,8 @@
       "request": "launch",
       "program": "${workspaceFolder}/scripts/evaluate_system.py",
       "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal"
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
     }
   ]
 }

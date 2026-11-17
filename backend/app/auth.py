@@ -4,6 +4,8 @@ import hmac
 import os
 import secrets
 import time
+from collections import defaultdict, deque
+from threading import Lock
 
 from fastapi import HTTPException, Request
 
@@ -11,11 +13,41 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 SESSION_COOKIE_NAME = "sentinelops_session"
 SESSION_TTL_SECONDS = 3600
+LOGIN_RATE_LIMIT_ATTEMPTS = 5
+LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
 SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "true").strip().lower() not in {
     "0",
     "false",
     "no",
 }
+_failed_login_attempts = defaultdict(deque)
+_login_attempts_lock = Lock()
+
+
+def is_login_rate_limited(client_ip: str) -> bool:
+    now = time.monotonic()
+    with _login_attempts_lock:
+        attempts = _failed_login_attempts[client_ip]
+        while attempts and now - attempts[0] >= LOGIN_RATE_LIMIT_WINDOW_SECONDS:
+            attempts.popleft()
+        if not attempts:
+            _failed_login_attempts.pop(client_ip, None)
+            return False
+        return len(attempts) >= LOGIN_RATE_LIMIT_ATTEMPTS
+
+
+def record_failed_login(client_ip: str) -> None:
+    now = time.monotonic()
+    with _login_attempts_lock:
+        attempts = _failed_login_attempts[client_ip]
+        while attempts and now - attempts[0] >= LOGIN_RATE_LIMIT_WINDOW_SECONDS:
+            attempts.popleft()
+        attempts.append(now)
+
+
+def clear_failed_logins(client_ip: str) -> None:
+    with _login_attempts_lock:
+        _failed_login_attempts.pop(client_ip, None)
 
 
 def auth_is_configured() -> bool:

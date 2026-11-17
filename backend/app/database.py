@@ -46,6 +46,7 @@ class IncidentRecord(Base):
     diagnostic_commands = Column(Text)
     fix_commands = Column(Text)
     risk_level = Column(String(20), default="SAFE")
+    status = Column(String(20), default="PENDING", nullable=False, server_default="PENDING")
     citations = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -69,6 +70,10 @@ def init_db():
         column["name"]
         for column in inspect(engine).get_columns("visitor_logs")
     }
+    incident_columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("incident_records")
+    }
     additions = {
         "city": "VARCHAR(100) DEFAULT 'Unknown'",
         "region": "VARCHAR(100) DEFAULT 'Unknown'",
@@ -79,6 +84,10 @@ def init_db():
         "accept_language": "VARCHAR(100) DEFAULT 'Unknown'",
     }
     with engine.begin() as connection:
+        if "status" not in incident_columns:
+            connection.execute(
+                text("ALTER TABLE incident_records ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'PENDING'")
+            )
         for name, definition in additions.items():
             if name not in visitor_columns:
                 connection.execute(

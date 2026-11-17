@@ -8,7 +8,7 @@ class LogSanitizer:
 
     PII_PATTERNS = [
         ("URL_CREDENTIALS", re.compile(r"(?i)(://[^:/@\s]+:)[^/@\s]+@"), r"\1[REDACTED_SECRET]@"),
-        ("IPV4", re.compile(r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"), "[REDACTED_IP]"),
+        ("IPV4", re.compile(r"\b(?!(?:127\.0\.0\.1|0\.0\.0\.0)\b)(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"), "[REDACTED_IP]"),
         ("AWS_ACCESS_KEY", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED_AWS_KEY]"),
         ("BEARER_TOKEN", re.compile(r"(?i)Bearer\s+[a-zA-Z0-9_\-\.=]+"), "Bearer [REDACTED_TOKEN]"),
         ("SECRET_ASSIGNMENT", re.compile(r"(?i)(password|passwd|secret|api_key|token)\s*[:=]\s*['\"]?[^\s'\"]+['\"]?"), r"\1=[REDACTED_SECRET]"),

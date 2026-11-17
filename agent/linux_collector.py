@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import argparse
 import time
+import json
 import requests
 from urllib.parse import urlsplit, urlunsplit
 
@@ -77,6 +78,62 @@ def collect_live_journal_errors() -> str:
     except (subprocess.SubprocessError, OSError, UnicodeError):
         return "ERROR: Unable to read journalctl directly. Fallback telemetry check."
 
+def collect_journal_batch(cursor: str = "") -> tuple[str, str]:
+    command = ["journalctl", "-p", "err", "-n", "25", "--no-pager", "-o", "json"]
+    if cursor:
+        command.extend(["--after-cursor", cursor])
+    try:
+        output = subprocess.check_output(
+            command,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError, UnicodeError):
+        return "", cursor
+
+    messages = []
+    latest_cursor = cursor
+    for line in output.splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        message = entry.get("MESSAGE")
+        if message:
+            messages.append(str(message))
+        if entry.get("__CURSOR"):
+            latest_cursor = str(entry["__CURSOR"])
+    return "\n".join(messages).strip(), latest_cursor
+
+def _journal_cursor_path() -> str:
+    configured_path = os.getenv("SENTINELOPS_CURSOR_FILE", "").strip()
+    if configured_path:
+        return os.path.expanduser(configured_path)
+    return os.path.join(
+        os.path.expanduser("~"),
+        ".local",
+        "state",
+        "sentinelops",
+        "journal.cursor",
+    )
+
+def _load_journal_cursor(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as cursor_file:
+            return cursor_file.read().strip()
+    except FileNotFoundError:
+        return ""
+
+def _save_journal_cursor(path: str, cursor: str) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temporary_path = f"{path}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as cursor_file:
+        cursor_file.write(cursor)
+    os.replace(temporary_path, path)
+
 def _webhook_config():
     backend_url = (os.getenv("SENTINELOPS_URL") or os.getenv("SENTINELOPS_API_URL") or "").strip()
     api_key = os.getenv("SENTINELOPS_API_KEY", "").strip()
@@ -141,15 +198,22 @@ if __name__ == "__main__":
         ship_alert(case["log"], stack_tag=case["stack"])
     elif args.daemon:
         print(f"Starting SentinelOps Linux Collector Daemon (polling every {args.interval}s)...")
-        last_seen = ""
+        cursor_path = _journal_cursor_path()
+        cursor = _load_journal_cursor(cursor_path)
         while True:
-            logs = collect_live_journal_errors()
-            if logs and logs != last_seen and "-- No entries --" not in logs:
+            logs, next_cursor = collect_journal_batch(cursor)
+            if logs:
                 try:
                     ship_alert(logs, stack_tag="Linux")
-                    last_seen = logs
-                except Exception as exc:
+                except RuntimeError as exc:
                     print(f"[Warn] Webhook delivery failed: {exc}")
+                else:
+                    if next_cursor and next_cursor != cursor:
+                        try:
+                            _save_journal_cursor(cursor_path, next_cursor)
+                            cursor = next_cursor
+                        except OSError as exc:
+                            print(f"[Warn] Could not save journal cursor: {exc}")
             time.sleep(args.interval)
     else:
         logs = collect_live_journal_errors()
