@@ -3,6 +3,7 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends openssh-server passwd \
+    && rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home --shell /bin/sh sentinelops-demo \
     && passwd -d sentinelops-demo \
