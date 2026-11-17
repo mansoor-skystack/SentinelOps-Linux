@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from . import auth
-from .database import init_db, SessionLocal, IncidentRecord, VisitorLog
+from .database import init_db, SessionLocal, IncidentRecord, RemediationAuditLog, VisitorLog
 from .sanitizer import LogSanitizer
 from .retriever import HybridKnowledgeEngine, RUNBOOKS_DIR
 from .llm import synthesize_diagnosis
@@ -637,21 +637,47 @@ def approve_and_remediate(
             raise HTTPException(status_code=404, detail="Incident record not found")
 
         commands = json.loads(rec.fix_commands or "[]")
-        if not commands:
-            raise HTTPException(status_code=400, detail="No remediation commands associated with this incident")
-
         diagnostic_report = json.loads(rec.diagnostic_report or "null")
+
+        def persist_rejection(status: str, detail: str) -> None:
+            db.add(
+                RemediationAuditLog(
+                    incident_id=rec.id,
+                    diagnostic_run_id=approval.diagnostic_run_id,
+                    actor="authenticated-admin-session",
+                    approved_by=None,
+                    outcome=status,
+                    commands=json.dumps(commands if isinstance(commands, list) else []),
+                    execution_report=json.dumps(
+                        {"executed": False, "status": status, "reason": detail, "outputs": []}
+                    ),
+                    verification_report=json.dumps(
+                        {"executed": False, "status": "NOT_RUN", "outputs": []}
+                    ),
+                )
+            )
+            db.commit()
+
+        if not isinstance(commands, list) or not commands:
+            detail = "No remediation commands associated with this incident"
+            persist_rejection("NO_COMMANDS", detail)
+            raise HTTPException(status_code=400, detail=detail)
+
         if (
             not isinstance(diagnostic_report, dict)
             or diagnostic_report.get("run_id") != approval.diagnostic_run_id
             or diagnostic_report.get("status") not in {"COMPLETED", "SIMULATION_ONLY"}
         ):
-            raise HTTPException(status_code=409, detail="Run read-only diagnostics before approving this fix")
+            detail = "Run read-only diagnostics before approving this fix"
+            persist_rejection("DIAGNOSTICS_REQUIRED", detail)
+            raise HTTPException(status_code=409, detail=detail)
         if (
             os.getenv("SSH_REMEDIATION_ENABLED", "").strip().lower() == "true"
             and not diagnostic_report.get("executed")
         ):
-            raise HTTPException(status_code=409, detail="Live fixes require successfully executed diagnostics")
+            detail = "Live fixes require successfully executed diagnostics"
+            persist_rejection("LIVE_DIAGNOSTICS_REQUIRED", detail)
+            raise HTTPException(status_code=409, detail=detail)
 
         execution_report = SSHRemediationEngine.execute_fix(
             hostname=rec.hostname,
@@ -675,9 +701,22 @@ def approve_and_remediate(
         rec.remediation_approved_by = "authenticated-admin-session"
         rec.remediation_report = json.dumps(execution_report)
         rec.post_check_report = json.dumps(post_check_report)
+        audit = RemediationAuditLog(
+            incident_id=rec.id,
+            diagnostic_run_id=approval.diagnostic_run_id,
+            actor="authenticated-admin-session",
+            approved_by=rec.remediation_approved_by,
+            outcome=str(execution_report.get("status", "UNKNOWN")),
+            commands=json.dumps(commands),
+            execution_report=json.dumps(execution_report),
+            verification_report=json.dumps(post_check_report),
+        )
+        db.add(audit)
         db.commit()
+        db.refresh(audit)
         return {
             "incident_id": rec.id,
+            "audit_id": audit.id,
             "hostname": rec.hostname,
             "remediation": execution_report,
             "post_check": post_check_report,
@@ -686,6 +725,38 @@ def approve_and_remediate(
         }
     finally:
         db.close()
+
+@app.get("/api/incidents/{incident_id}/remediation-audit")
+def list_remediation_audit(
+    incident_id: int,
+    limit: int = Query(default=50, ge=1, le=200),
+    _: None = Depends(auth.require_admin),
+):
+    with SessionLocal() as db:
+        if not db.query(IncidentRecord.id).filter(IncidentRecord.id == incident_id).first():
+            raise HTTPException(status_code=404, detail="Incident record not found")
+        rows = (
+            db.query(RemediationAuditLog)
+            .filter(RemediationAuditLog.incident_id == incident_id)
+            .order_by(RemediationAuditLog.id.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": row.id,
+                "incident_id": row.incident_id,
+                "diagnostic_run_id": row.diagnostic_run_id,
+                "actor": row.actor,
+                "approved_by": row.approved_by or None,
+                "outcome": row.outcome,
+                "commands": json.loads(row.commands),
+                "execution_report": json.loads(row.execution_report),
+                "verification_report": json.loads(row.verification_report),
+                "created_at": row.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            }
+            for row in rows
+        ]
 
 @app.get("/api/visitors")
 def list_visitors(_: None = Depends(auth.require_admin)):

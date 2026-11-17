@@ -15,7 +15,7 @@ class SSHRemediationEngine:
     """Runs exact-allowlisted checks and explicitly approved fixes over pinned SSH."""
 
     READ_ONLY_COMMANDS = {
-        "df", "dmesg", "free", "findmnt", "ip", "journalctl", "lsblk",
+        "df", "dmesg", "free", "findmnt", "ip", "journalctl", "lsblk", "test",
         "pg_isready", "ps", "ss", "systemctl", "uname", "uptime", "vmstat",
     }
     SHELL_OPERATORS = re.compile(r"[;&|<>`$\r\n\x00]")
@@ -224,10 +224,10 @@ class SSHRemediationEngine:
             if label == "remediation" and any(result["exit_code"] != 0 for result in results):
                 report["status"] = "COMMANDS_FAILED"
             return report
-        except (paramiko.SSHException, OSError, EOFError) as exc:
+        except (paramiko.SSHException, OSError, EOFError, TimeoutError) as exc:
             return {
                 "executed": False,
-                "status": "SSH_CONNECTION_ERROR",
+                "status": "SSH_TIMEOUT" if isinstance(exc, TimeoutError) else "SSH_CONNECTION_ERROR",
                 "reason": f"SSH operation failed ({type(exc).__name__}).",
                 "outputs": results,
             }

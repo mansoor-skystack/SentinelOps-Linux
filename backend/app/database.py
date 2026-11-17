@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, inspect, text
+from sqlalchemy import create_engine, Column, ForeignKey, Integer, String, Text, DateTime, Float, inspect, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -55,6 +55,19 @@ class IncidentRecord(Base):
     remediation_approved_by = Column(String(120))
     correlation_id = Column(Integer, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+class RemediationAuditLog(Base):
+    __tablename__ = "remediation_audit_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    incident_id = Column(Integer, ForeignKey("incident_records.id"), nullable=False, index=True)
+    diagnostic_run_id = Column(String(64))
+    actor = Column(String(120), nullable=False)
+    approved_by = Column(String(120))
+    outcome = Column(String(50), nullable=False)
+    commands = Column(Text, nullable=False)
+    execution_report = Column(Text, nullable=False)
+    verification_report = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
 class VisitorLog(Base):
     __tablename__ = "visitor_logs"

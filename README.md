@@ -14,7 +14,7 @@ Agent webhooks also pass CPU load, memory usage, and disk usage into model-backe
 
 The dashboard separates **Manual Logs** from **VM Agent Logs**. Incidents start as **Pending**; admins can mark an issue **Completed** after addressing it or return it to **Pending**. Resolution status is stored with the incident.
 
-The VM collector only submits logs and telemetry; it never runs the suggested fixes. Admins can run exact-allowlisted read-only diagnostics and inspect their output before explicitly approving the proposed fixes. A fix is followed by configured health checks; SentinelOps marks it completed automatically only when those checks pass. Execution reports and approval time are retained with the incident.
+The VM collector only submits logs and telemetry; it never runs the suggested fixes. Admins can run exact-allowlisted read-only diagnostics and inspect their output before explicitly approving the proposed fixes. A fix is followed by configured health checks; SentinelOps marks it completed automatically only when those checks pass. The incident keeps the latest reports, and a separate append-only remediation audit table retains authenticated attempts for existing incidents, including blocked requests, commands, exit results, and verification outcomes.
 
 The curated incident runbooks in `backend/data/runbooks/` are indexed separately from the public TLDR command references in `backend/data/public-reference/tldr/`. Public references can help with command context, but they are weighted as lower-trust retrieval material and cannot authorize offline fix commands. Cross-host correlation is a five-minute lexical signal for shared symptoms, not proof of a common root cause.
 
@@ -47,6 +47,7 @@ The curated incident runbooks in `backend/data/runbooks/` are indexed separately
 - Live SSH remediation is disabled by default. To enable it, configure exact `SSH_ALLOWED_HOSTS`, `SSH_ALLOWED_DIAGNOSTIC_COMMANDS`, `SSH_ALLOWED_COMMANDS`, and `SSH_ALLOWED_POSTCHECK_COMMANDS` as comma-separated hosts and JSON arrays of exact command strings, a dedicated SSH user/private key, and a pinned `SSH_KNOWN_HOSTS` file. Diagnostics and post-checks must be single read-only commands without shell operators. Do not enable it for broad host sets or AI-generated commands that are not in the exact allowlist. Successful fixes are not marked complete unless all configured post-checks pass.
 - The collector raises proactive alerts at 90% by default for sampled CPU utilization, memory, and disk. CPU utilization is measured from `/proc/stat`; the separate `cpu_load` telemetry remains a one-minute load average. Configure `SENTINELOPS_CPU_THRESHOLD_PCT`, `SENTINELOPS_MEMORY_THRESHOLD_PCT`, and `SENTINELOPS_DISK_THRESHOLD_PCT`; a five-point clear margin and five-minute cooldown suppress alert flapping. Threshold state is stored beside the journal cursor under the service state directory.
 - To install and run the Linux collector, follow [Deploy the Linux collector agent](#deploy-the-linux-collector-agent). Keep its API key in the protected environment file, not in the service unit or repository.
+- Collector-side redaction is opt-in. Set `SENTINELOPS_REDACT_LOCAL=true` in the protected agent environment file, or pass `--redact-local` for a one-shot invocation, to sanitize logs on the VM before webhook transmission. Install both `linux_collector.py` and `log_sanitizer.py` on the VM; without this option the backend sanitizes after receiving the HTTPS request.
 - Admin sign-in allows five failed attempts per client IP in a five-minute window. This in-memory limit is per app process; use an edge/reverse-proxy limit as well, especially with multiple app instances.
 
 ## Run with Docker
@@ -60,6 +61,31 @@ docker run --rm -p 8000:8000 --env-file .env \
   -v sentinelops-runbooks:/app/backend/data/runbooks sentinelops
 ```
 Set `DATABASE_URL` to a persistent database for production deployments. Configure the admin credentials and any API keys through the environment or a secret manager.
+
+## Isolated Docker Compose demo
+
+The Compose stack runs the app with PostgreSQL and a disposable OpenSSH target. The target has no published host port and is reachable only from the app on a private Docker network. PostgreSQL uses a disposable self-signed TLS certificate because the backend requires TLS for non-local database hosts. SSH client, SSH host, and database TLS keys are generated into separate Docker-managed volumes; they are not stored in the repository. `SSH_REMEDIATION_ENABLED` defaults to `false`.
+
+1. Copy `.env.demo.example` to `.env.demo` and set strong, local-only values for `ADMIN_PASSWORD`, `SESSION_SECRET`, `SENTINELOPS_API_KEY`, and `POSTGRES_PASSWORD`. Generate values with `python -c "import secrets; print('ADMIN_PASSWORD='+secrets.token_urlsafe(24)); print('SESSION_SECRET='+secrets.token_urlsafe(32)); print('SENTINELOPS_API_KEY='+secrets.token_hex(32)); print('POSTGRES_PASSWORD='+secrets.token_hex(24))"`. Do not reuse production credentials.
+2. Start the stack and seed sample incidents:
+   ```bash
+   docker compose --env-file .env.demo up --build -d
+   docker compose --env-file .env.demo exec app python scripts/seed_demo.py --confirm
+   ```
+3. Open `http://127.0.0.1:8001` and sign in with the demo admin password. Change `SENTINELOPS_DEMO_PORT` if that loopback port is already in use.
+4. To exercise SSH only against the disposable container, change `SSH_REMEDIATION_ENABLED=false` to `true` in `.env.demo`, then recreate the app:
+   ```bash
+   docker compose --env-file .env.demo up -d --force-recreate app
+   ```
+   Select the seeded incident for `ssh-target`, run diagnostics, and approve the allowlisted marker-file command. The post-check verifies the marker. No command is run against a host outside the Compose network.
+5. Remove the containers, database, and generated SSH keys with:
+   ```bash
+   docker compose --env-file .env.demo down -v
+   ```
+
+The seeder refuses to run unless the Compose demo-mode environment is present and `--confirm` is supplied. It adds records idempotently and does not delete existing incidents.
+
+The GitHub Actions workflow runs the backend tests, scans tracked source with Gitleaks, builds the application and demo SSH images, and scans those images with Trivy. It uses no deployment credentials.
 
 ## Deploy the Linux collector agent
 
@@ -79,6 +105,8 @@ Run these steps on each Linux host you want to monitor. The collector sends tele
    sudo install -o root -g root -m 755 \
      agent/linux_collector.py /opt/sentinelops/linux_collector.py
    sudo install -o root -g root -m 644 \
+     agent/log_sanitizer.py /opt/sentinelops/log_sanitizer.py
+   sudo install -o root -g root -m 644 \
      agent/sentinelops-agent.service \
      /etc/systemd/system/sentinelops-agent.service
    ```
@@ -95,6 +123,7 @@ Run these steps on each Linux host you want to monitor. The collector sends tele
    ```ini
    SENTINELOPS_URL=https://sentinelops-linux.onrender.com
    SENTINELOPS_API_KEY=replace_with_the_same_key_configured_in_Render
+   SENTINELOPS_REDACT_LOCAL=true
    SENTINELOPS_CPU_THRESHOLD_PCT=90
    SENTINELOPS_MEMORY_THRESHOLD_PCT=90
    SENTINELOPS_DISK_THRESHOLD_PCT=90

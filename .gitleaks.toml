@@ -1,0 +1,17 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic values used only by sanitizer regression tests"
+regexes = [
+  '''AKIAIOSFODNN7EXAMPLE''',
+  '''synthetic-[A-Za-z0-9._-]+''',
+  '''SamplePass-[0-9]+''',
+  '''sample-pass-[0-9]+''',
+  '''example-secret-value''',
+  '''fake-api-key-value''',
+  '''vm-secret''',
+  '''test-admin-password-123''',
+  '''test-session-secret-''',
+  '''test-session-secret-[A-Za-z0-9_-]+''',
+]

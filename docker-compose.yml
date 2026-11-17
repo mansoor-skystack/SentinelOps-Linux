@@ -1,0 +1,100 @@
+services:
+  db:
+    image: postgres:16-alpine
+    depends_on:
+      ssh-keys:
+        condition: service_completed_successfully-alpine
+    environment:
+      POSTGRES_DB: sentinelops
+      POSTGRES_USER: sentinelops
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.demo}
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/run/db-tls/postgres_server.crt
+      - -c
+      - ssl_key_file=/run/db-tls/postgres_server.key
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - demo-db-tls:/run/db-tls:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinelops -d sentinelops"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - app-network
+
+  ssh-keys:
+    build:
+      context: demo/ssh-keys
+    network_mode: none
+    restart: "no"
+    volumes:
+      - demo-ssh-client-keys:/ssh-client
+      - demo-ssh-target-keys:/ssh-target
+      - demo-db-tls:/db-tls
+
+  ssh-target:
+    build:
+      context: demo/ssh-target
+    depends_on:
+      ssh-keys:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /run
+      - /tmp
+    volumes:
+      - demo-ssh-target-keys:/run/demo-keys:ro
+    networks:
+      - demo-ssh-network
+
+  app:
+    build:
+      context: .
+    depends_on:
+      db:
+        condition: service_healthy
+      ssh-keys:
+        condition: service_completed_successfully
+      ssh-target:
+        condition: service_started
+    ports:
+      - "127.0.0.1:${SENTINELOPS_DEMO_PORT:-8001}:8000"
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env.demo}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env.demo}
+      SESSION_COOKIE_SECURE: "false"
+      SENTINELOPS_API_KEY: ${SENTINELOPS_API_KEY:?Set SENTINELOPS_API_KEY in .env.demo}
+      DATABASE_URL: postgresql+psycopg2://sentinelops:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.demo}@db:5432/sentinelops
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-20b}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      SSH_REMEDIATION_ENABLED: ${SSH_REMEDIATION_ENABLED:-false}
+      SSH_ALLOWED_HOSTS: ssh-target
+      SSH_ALLOWED_DIAGNOSTIC_COMMANDS: '["df -h"]'
+      SSH_ALLOWED_COMMANDS: '["touch /tmp/sentinelops-demo-fixed"]'
+      SSH_ALLOWED_POSTCHECK_COMMANDS: '["test -f /tmp/sentinelops-demo-fixed"]'
+      TARGET_SSH_USER: sentinelops-demo
+      TARGET_SSH_KEY_PATH: /run/demo-keys/demo_client_ed25519
+      SSH_KNOWN_HOSTS: /run/demo-keys/known_hosts
+      SENTINELOPS_DEMO_MODE: "true"
+    volumes:
+      - demo-ssh-client-keys:/run/demo-keys:ro
+    networks:
+      - app-network
+      - demo-ssh-network
+
+volumes:
+  postgres-data:
+  demo-db-tls:
+  demo-ssh-client-keys:
+  demo-ssh-target-keys:
+
+networks:
+  app-network:
+  demo-ssh-network:
+    internal: true

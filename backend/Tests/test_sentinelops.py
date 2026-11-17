@@ -2,6 +2,7 @@ import os
 import json
 import pytest
 import runpy
+import sys
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,6 +14,9 @@ os.environ["GROQ_API_KEY"] = ""
 os.environ["SENTINELOPS_API_KEY"] = ""
 os.environ["ADMIN_PASSWORD"] = ""
 os.environ["SESSION_SECRET"] = ""
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
 
 from fastapi.testclient import TestClient
 from app import main
@@ -23,7 +27,14 @@ from app.main import app
 from app.sanitizer import LogSanitizer
 from app.guardrails import CommandSafetyGuardrail
 from app.remediator import SSHRemediationEngine
-from app.database import _enforce_remote_postgres_tls, engine, IncidentRecord, SessionLocal, VisitorLog
+from app.database import (
+    _enforce_remote_postgres_tls,
+    engine,
+    IncidentRecord,
+    RemediationAuditLog,
+    SessionLocal,
+    VisitorLog,
+)
 from sqlalchemy.engine import make_url
 from types import SimpleNamespace
 
@@ -68,6 +79,7 @@ def test_admin_routes_fail_closed_when_auth_is_unconfigured(client, monkeypatch)
     status = client.get("/api/auth/status").json()
     assert status == {"configured": False, "authenticated": False}
     assert client.get("/api/incidents").status_code == 503
+    assert client.get("/api/incidents/1/remediation-audit").status_code == 503
 
 
 def test_cors_requires_exact_secure_origins():
@@ -264,6 +276,50 @@ def test_ssh_remediation_is_disabled_by_default(monkeypatch):
     report = SSHRemediationEngine.execute_fix("test-host", ["df -h"], "SAFE")
     assert report["executed"] is False
     assert report["status"] == "SIMULATION_ONLY"
+
+def test_collector_redacts_before_posting_when_enabled(monkeypatch):
+    sent = {}
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"incident_id": 321}
+
+    def fake_post(url, **kwargs):
+        sent["url"] = url
+        sent.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setenv("SENTINELOPS_URL", "https://sentinelops.example.invalid")
+    monkeypatch.setenv("SENTINELOPS_API_KEY", "synthetic-agent-key")
+    monkeypatch.setattr(COLLECTOR["requests"], "post", fake_post)
+    COLLECTOR["ship_alert"](
+        "ERROR password=vm-secret peer=203.0.113.8 bind=127.0.0.1",
+        telemetry={
+            "hostname": "redaction-test-vm",
+            "cpu_load": 0.5,
+            "mem_used_pct": 20.0,
+            "disk_used_pct": 30.0,
+        },
+        redact_local=True,
+    )
+
+    sent_log = sent["json"]["raw_log"]
+    assert "vm-secret" not in sent_log
+    assert "203.0.113.8" not in sent_log
+    assert "127.0.0.1" in sent_log
+    assert sent["url"] == "https://sentinelops.example.invalid/api/webhook/ingest"
+
+def test_demo_seeder_requires_demo_mode_and_confirmation(monkeypatch):
+    seed_demo = runpy.run_path(str(_REPOSITORY_ROOT / "scripts" / "seed_demo.py"))
+    monkeypatch.delenv("SENTINELOPS_DEMO_MODE", raising=False)
+    monkeypatch.setattr(sys, "argv", ["seed_demo.py", "--confirm"])
+    with pytest.raises(SystemExit) as exc_info:
+        seed_demo["main"]()
+    assert exc_info.value.code == 2
 
 
 def test_ssh_remediation_requires_allowlisted_host_and_command(monkeypatch):
@@ -704,6 +760,7 @@ def test_diagnose_and_remediate_workflow(admin_client, monkeypatch):
         json={"approved": True, "diagnostic_run_id": diagnostics["run_id"]},
     )
     assert rem_res.status_code == 200
+    assert rem_res.json()["audit_id"]
     assert rem_res.json()["remediation"]["executed"] is False
     assert rem_res.json()["remediation"]["status"] == "SIMULATION_ONLY"
     assert rem_res.json()["post_check"]["status"] == "SIMULATION_ONLY"
@@ -711,6 +768,19 @@ def test_diagnose_and_remediate_workflow(admin_client, monkeypatch):
     listed = next(item for item in client.get("/api/incidents").json() if item["id"] == inc_id)
     assert listed["diagnostic_report"]["run_id"] == diagnostics["run_id"]
     assert listed["remediation_report"]["status"] == "SIMULATION_ONLY"
+    audit = client.get(f"/api/incidents/{inc_id}/remediation-audit")
+    assert audit.status_code == 200
+    history = audit.json()
+    assert [entry["outcome"] for entry in history] == [
+        "SIMULATION_ONLY",
+        "DIAGNOSTICS_REQUIRED",
+    ]
+    assert history[0]["execution_report"]["outputs"]
+    assert history[0]["verification_report"]["status"] == "SIMULATION_ONLY"
+    with SessionLocal() as db:
+        assert db.query(RemediationAuditLog).filter(
+            RemediationAuditLog.incident_id == inc_id
+        ).count() == 2
 
 
 def test_slack_notification_runs_as_background_task(admin_client, monkeypatch):

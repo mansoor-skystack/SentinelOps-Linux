@@ -15,6 +15,13 @@ import requests
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+try:
+    from log_sanitizer import LogSanitizer
+except ModuleNotFoundError as exc:
+    if exc.name != "log_sanitizer":
+        raise
+    from agent.log_sanitizer import LogSanitizer
+
 SIMULATED_CRASHES = {
     "nginx": {
         "stack": "Nginx",
@@ -282,8 +289,16 @@ def _webhook_config():
     endpoint = urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
     return endpoint, api_key
 
-def ship_alert(raw_log: str, stack_tag: str = "Linux", telemetry: Optional[Dict[str, Any]] = None):
+def ship_alert(
+    raw_log: str,
+    stack_tag: str = "Linux",
+    telemetry: Optional[Dict[str, Any]] = None,
+    *,
+    redact_local: bool = False,
+):
     api_endpoint, api_key = _webhook_config()
+    if redact_local:
+        raw_log, _, _ = LogSanitizer.filter_and_sanitize(raw_log)
     if telemetry is None:
         hostname, cpu_load, mem_pct, disk_pct = collect_system_metrics()
     else:
@@ -322,11 +337,17 @@ if __name__ == "__main__":
     parser.add_argument("--simulate", choices=list(SIMULATED_CRASHES.keys()), help="Simulate a real Linux service crash")
     parser.add_argument("--daemon", action="store_true", help="Run continuously as a systemd background watcher")
     parser.add_argument("--interval", type=int, default=30, help="Polling interval in seconds for daemon mode")
+    parser.add_argument(
+        "--redact-local",
+        action="store_true",
+        default=os.getenv("SENTINELOPS_REDACT_LOCAL", "").strip().lower() == "true",
+        help="Sanitize log text on this VM before sending it to the backend",
+    )
     args = parser.parse_args()
 
     if args.simulate:
         case = SIMULATED_CRASHES[args.simulate]
-        ship_alert(case["log"], stack_tag=case["stack"])
+        ship_alert(case["log"], stack_tag=case["stack"], redact_local=args.redact_local)
     elif args.daemon:
         print(f"Starting SentinelOps Linux Collector Daemon (polling every {args.interval}s)...")
         cursor_path = _journal_cursor_path()
@@ -356,7 +377,12 @@ if __name__ == "__main__":
                 alert_parts.append("SentinelOps proactive telemetry threshold warning:\n- " + "\n- ".join(threshold_alerts))
             if alert_parts:
                 try:
-                    ship_alert("\n\n".join(alert_parts), stack_tag="Linux", telemetry=telemetry)
+                    ship_alert(
+                        "\n\n".join(alert_parts),
+                        stack_tag="Linux",
+                        telemetry=telemetry,
+                        redact_local=args.redact_local,
+                    )
                 except RuntimeError as exc:
                     print(f"[Warn] Webhook delivery failed: {exc}")
                 else:
@@ -380,4 +406,4 @@ if __name__ == "__main__":
             time.sleep(args.interval)
     else:
         logs = collect_live_journal_errors()
-        ship_alert(logs, stack_tag="Linux")
+        ship_alert(logs, stack_tag="Linux", redact_local=args.redact_local)

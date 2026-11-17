@@ -51,6 +51,8 @@
       const [updatingIncidentStatusId, setUpdatingIncidentStatusId] = useState(null);
       const [diagnosticResults, setDiagnosticResults] = useState({});
       const [remediationResults, setRemediationResults] = useState({});
+      const [remediationAuditHistory, setRemediationAuditHistory] = useState({});
+      const [loadingAuditIncidentId, setLoadingAuditIncidentId] = useState(null);
       const [selectedIncidentId, setSelectedIncidentId] = useState(null);
       const [copied, setCopied] = useState(false);
       const [logCopied, setLogCopied] = useState(false);
@@ -78,6 +80,22 @@
         }
       };
 
+      const fetchRemediationAudit = async (incidentId) => {
+        setLoadingAuditIncidentId(incidentId);
+        try {
+          const res = await fetch(`/api/incidents/${incidentId}/remediation-audit`, {
+            credentials: "same-origin"
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || `Unable to load remediation history (HTTP ${res.status})`);
+          setRemediationAuditHistory((current) => ({ ...current, [incidentId]: data }));
+        } catch (error) {
+          setErrorMsg(error.message);
+        } finally {
+          setLoadingAuditIncidentId(null);
+        }
+      };
+
       useEffect(() => {
         let active = true;
         fetch("/api/auth/status", { credentials: "same-origin", cache: "no-store" })
@@ -98,6 +116,12 @@
           });
         return () => { active = false; };
       }, []);
+
+      useEffect(() => {
+        if (authState.authenticated && selectedIncidentId !== null) {
+          fetchRemediationAudit(selectedIncidentId);
+        }
+      }, [authState.authenticated, selectedIncidentId]);
 
       useEffect(() => {
         if (!authState.authenticated) {
@@ -236,7 +260,12 @@
             body: JSON.stringify({ approved: true, diagnostic_run_id: diagnostics.run_id })
           });
           const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || `Remediation failed (HTTP ${res.status})`);
+          if (!res.ok) {
+            const detail = data.detail || `Remediation failed (HTTP ${res.status})`;
+            await fetchRemediationAudit(incident.id);
+            throw new Error(detail);
+          }
+          await fetchRemediationAudit(incident.id);
           const result = {
             ...data.remediation,
             post_check: data.post_check,
@@ -956,6 +985,38 @@
                       <p className="mt-2 text-xs text-slate-300">Post-fix health: {selectedIncident.post_check_report?.status || "Not run"}</p>
                     </section>
                   )}
+
+                  <section>
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400">Remediation attempt history</h3>
+                    {loadingAuditIncidentId === selectedIncident.id && (
+                      <p className="mt-2 text-xs text-slate-400">Loading audit history...</p>
+                    )}
+                    {(remediationAuditHistory[selectedIncident.id] || []).length === 0 &&
+                      loadingAuditIncidentId !== selectedIncident.id && (
+                        <p className="mt-2 text-xs text-slate-500">No remediation attempts recorded.</p>
+                      )}
+                    <div className="mt-2 space-y-2">
+                      {(remediationAuditHistory[selectedIncident.id] || []).map((entry) => (
+                        <details key={entry.id} className="rounded-lg border border-slate-800 bg-[#080d17] p-3">
+                          <summary className="cursor-pointer text-xs text-slate-200">
+                            Attempt #{entry.id} · {entry.outcome} · {entry.created_at}
+                          </summary>
+                          <p className="mt-2 whitespace-pre-wrap text-xs text-slate-400">
+                            Commands: {(entry.commands || []).join("\n") || "None"}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-400">
+                            Verification: {entry.verification_report?.status || "Not run"}
+                          </p>
+                          <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-[#0d1420] p-3 font-mono text-xs text-slate-300">
+                            {JSON.stringify({
+                              execution: entry.execution_report,
+                              verification: entry.verification_report
+                            }, null, 2)}
+                          </pre>
+                        </details>
+                      ))}
+                    </div>
+                  </section>
 
                   {(selectedIncident.fix_commands || []).length > 0 && (
                     <section className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-700/50 bg-amber-950/20 p-4">

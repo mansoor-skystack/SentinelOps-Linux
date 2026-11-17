@@ -1,11 +1,16 @@
 .git
+.github
+.demo-secrets
 .env
 .env.*
 !.env.example
+!.env.demo.example
 venv
 .venv
 __pycache__
 *.pyc
+*.db
+*.sqlite3
 backend/Tests
 backend/tests
 test1.zip
