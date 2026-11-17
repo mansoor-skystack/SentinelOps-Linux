@@ -3,6 +3,7 @@ import json
 import pytest
 import runpy
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 _TEST_STORAGE = tempfile.TemporaryDirectory(prefix="sentinelops-tests-")
@@ -17,6 +18,7 @@ from fastapi.testclient import TestClient
 from app import main
 from app import auth
 from app import llm
+from app import remediator
 from app.main import app
 from app.sanitizer import LogSanitizer
 from app.guardrails import CommandSafetyGuardrail
@@ -275,6 +277,84 @@ def test_ssh_remediation_requires_allowlisted_host_and_command(monkeypatch):
     blocked_command = SSHRemediationEngine.execute_fix("trusted-host", ["df -h; id"], "SAFE")
     assert blocked_command["status"] == "BLOCKED_COMMAND"
 
+def test_read_only_diagnostics_reject_shell_and_write_commands(monkeypatch):
+    monkeypatch.setenv("SSH_REMEDIATION_ENABLED", "false")
+    assert SSHRemediationEngine.execute_diagnostics("test-host", ["df -h"])["status"] == "SIMULATION_ONLY"
+    assert SSHRemediationEngine.execute_diagnostics("test-host", ["df -h && free -m"])["status"] == "BLOCKED_COMMAND"
+    assert SSHRemediationEngine.execute_diagnostics("test-host", ["sudo systemctl restart nginx"])["status"] == "BLOCKED_COMMAND"
+    assert SSHRemediationEngine.execute_diagnostics("test-host", ["ip addr add 192.0.2.10/24 dev eth0"])["status"] == "BLOCKED_COMMAND"
+    assert SSHRemediationEngine.execute_diagnostics("test-host", ["dmesg --clear"])["status"] == "BLOCKED_COMMAND"
+    assert SSHRemediationEngine.execute_diagnostics("test-host", ["ss -K dst 192.0.2.10"])["status"] == "BLOCKED_COMMAND"
+
+def test_remediation_records_failed_exit_and_sanitizes_command_output(monkeypatch, tmp_path):
+    class FakeChannel:
+        def __init__(self):
+            self.stdout_data = bytearray(b"password=synthetic-secret\n")
+            self.stderr_data = bytearray()
+
+        def exit_status_ready(self):
+            return True
+
+        def recv_ready(self):
+            return bool(self.stdout_data)
+
+        def recv_stderr_ready(self):
+            return bool(self.stderr_data)
+
+        def recv(self, size):
+            chunk = bytes(self.stdout_data[:size])
+            del self.stdout_data[:size]
+            return chunk
+
+        def recv_stderr(self, size):
+            chunk = bytes(self.stderr_data[:size])
+            del self.stderr_data[:size]
+            return chunk
+
+        def recv_exit_status(self):
+            return 1
+
+    channel = FakeChannel()
+
+    class FakeClient:
+        def load_host_keys(self, _):
+            pass
+
+        def set_missing_host_key_policy(self, _):
+            pass
+
+        def connect(self, **_):
+            pass
+
+        def exec_command(self, command, **_):
+            assert command == "sudo systemctl restart app.service"
+            stream = SimpleNamespace(channel=channel)
+            return None, stream, stream
+
+        def close(self):
+            pass
+
+    key_path = tmp_path / "test.key"
+    known_hosts_path = tmp_path / "known_hosts"
+    key_path.write_text("test-only", encoding="utf-8")
+    known_hosts_path.write_text("test-only", encoding="utf-8")
+    monkeypatch.setattr(remediator.paramiko, "SSHClient", FakeClient)
+    monkeypatch.setenv("SSH_REMEDIATION_ENABLED", "true")
+    monkeypatch.setenv("SSH_ALLOWED_HOSTS", "trusted-host")
+    monkeypatch.setenv("SSH_ALLOWED_COMMANDS", '["sudo systemctl restart app.service"]')
+    monkeypatch.setenv("TARGET_SSH_USER", "sentinelops")
+    monkeypatch.setenv("TARGET_SSH_KEY_PATH", str(key_path))
+    monkeypatch.setenv("SSH_KNOWN_HOSTS", str(known_hosts_path))
+
+    report = SSHRemediationEngine.execute_fix(
+        "trusted-host",
+        ["sudo systemctl restart app.service"],
+        "SAFE",
+    )
+    assert report["status"] == "COMMANDS_FAILED"
+    assert report["outputs"][0]["exit_code"] == 1
+    assert "synthetic-secret" not in report["outputs"][0]["stdout"]
+
 
 def test_remote_postgres_requires_tls():
     remote = _enforce_remote_postgres_tls(make_url("postgresql://user:pass@db.example.invalid/app?sslmode=disable"))
@@ -326,6 +406,46 @@ def test_collector_journal_cursor_tracks_only_new_entries(monkeypatch, tmp_path)
     COLLECTOR["_save_journal_cursor"](cursor_path, cursor)
     assert COLLECTOR["_load_journal_cursor"](cursor_path) == "cursor-2"
 
+def test_collector_thresholds_deduplicate_and_rearm_with_hysteresis():
+    configuration = {
+        "limits": {
+            "cpu_used_pct": 90.0,
+            "mem_used_pct": 90.0,
+            "disk_used_pct": 90.0,
+        },
+        "clear_margin_pct": 5.0,
+        "cooldown_seconds": 300,
+    }
+    state = {"active": [], "last_alert_at": {}}
+    alerts, state = COLLECTOR["detect_threshold_alerts"](
+        90.0, 91.0, 50.0, state, configuration=configuration, now=1000
+    )
+    assert len(alerts) == 2
+    assert any("CPU usage" in alert for alert in alerts)
+
+    alerts, state = COLLECTOR["detect_threshold_alerts"](
+        95.0, 95.0, 50.0, state, configuration=configuration, now=1100
+    )
+    assert alerts == []
+
+    alerts, state = COLLECTOR["detect_threshold_alerts"](
+        84.0, 84.0, 50.0, state, configuration=configuration, now=1200
+    )
+    assert alerts == []
+    assert state["active"] == []
+
+    alerts, _ = COLLECTOR["detect_threshold_alerts"](
+        90.0, 91.0, 50.0, state, configuration=configuration, now=1401
+    )
+    assert len(alerts) == 2
+
+def test_collector_cpu_utilization_uses_proc_stat_deltas(monkeypatch):
+    readings = iter([(1000, 800), (1100, 870)])
+    collector_globals = COLLECTOR["collect_cpu_utilization_pct"].__globals__
+    monkeypatch.setitem(collector_globals, "_read_cpu_counters", lambda: next(readings))
+    monkeypatch.setattr(COLLECTOR["time"], "sleep", lambda _: None)
+    assert COLLECTOR["collect_cpu_utilization_pct"]() == 30.0
+
 
 def test_pii_and_secret_sanitization():
     raw = (
@@ -370,6 +490,27 @@ def test_offline_diagnosis_parses_resolution_commands_without_nginx_default(monk
         "sudo systemctl status docker.service",
     ]
     assert all("nginx" not in command for command in diagnosis["fix_commands"])
+
+def test_public_reference_cannot_authorize_offline_fix_commands(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "")
+    chunks = [{
+        "text": "## Resolution\n- sudo systemctl restart nginx.service",
+        "meta": {"source": "tldr/systemctl.md", "section": "Resolution", "type": "public_reference"},
+    }]
+    diagnosis = llm.synthesize_diagnosis("nginx failed", chunks)
+    assert diagnosis["fix_commands"] == []
+    assert "Public command reference" in diagnosis["citations"][0]
+
+def test_index_separates_curated_runbooks_from_public_references(client):
+    engine = main.rag_engine
+    sources = {
+        metadata["source"]: metadata["type"]
+        for metadata in engine.metadatas
+    }
+    assert sources["linux-memory-oom.md"] == "verified_runbook"
+    assert sources["tldr/systemctl.md"] == "public_reference"
+    assert "TLDR_LICENSE.md" not in sources
+    assert "kernel-oom-memory.md" not in sources
 
 
 def test_groq_model_is_configurable(monkeypatch):
@@ -430,6 +571,72 @@ def test_agent_telemetry_reaches_diagnosis(admin_client, monkeypatch):
         "disk_used_pct": 48.0,
     }
 
+def test_correlates_matching_incidents_across_hosts_in_five_minute_window(admin_client, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "")
+    monkeypatch.setattr(main, "synthesize_diagnosis", lambda *args, **kwargs: {
+        "root_cause": "Nginx upstream database connection refused",
+        "diagnostic_commands": ["df -h"],
+        "fix_commands": [],
+        "citations": [],
+        "risk_level": "SAFE",
+    })
+    payload = {
+        "raw_log": "nginx 502 upstream database connection refused",
+        "stack_filter": "Nginx",
+        "source_type": "pytest",
+    }
+    first = admin_client.post(
+        "/api/diagnose",
+        json={**payload, "hostname": "correlation-node-a"},
+    )
+    second = admin_client.post(
+        "/api/diagnose",
+        json={**payload, "hostname": "correlation-node-b"},
+    )
+    assert first.status_code == second.status_code == 200
+    assert first.json()["correlation_id"] is None
+    assert second.json()["correlation_id"] == first.json()["incident_id"]
+    assert second.json()["correlated_hosts"] == 2
+
+    incidents = admin_client.get("/api/incidents").json()
+    correlated = [row for row in incidents if row["hostname"].startswith("correlation-node-")]
+    assert len(correlated) == 2
+    assert {row["correlated_hosts"] for row in correlated} == {2}
+
+def test_incident_correlation_ignores_records_older_than_five_minutes(admin_client, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "")
+    isolated_log = "tamarind rift packet queue mismatch"
+    isolated_cause = "tamarind rift packet queue mismatch"
+    with SessionLocal() as db:
+        db.add(IncidentRecord(
+            hostname="expired-correlation-node",
+            source_type="pytest",
+            stack_tag="Nginx",
+            sanitized_log=isolated_log,
+            root_cause=isolated_cause,
+            diagnostic_commands="[]",
+            fix_commands="[]",
+            risk_level="SAFE",
+            citations="[]",
+            created_at=datetime.utcnow() - timedelta(minutes=6),
+        ))
+        db.commit()
+    monkeypatch.setattr(main, "synthesize_diagnosis", lambda *args, **kwargs: {
+        "root_cause": isolated_cause,
+        "diagnostic_commands": ["df -h"],
+        "fix_commands": [],
+        "citations": [],
+        "risk_level": "SAFE",
+    })
+    response = admin_client.post("/api/diagnose", json={
+        "raw_log": isolated_log,
+        "stack_filter": "Nginx",
+        "hostname": "new-correlation-node",
+        "source_type": "pytest",
+    })
+    assert response.status_code == 200
+    assert response.json()["correlation_id"] is None
+
 
 def test_groq_client_setup_failure_is_reported_to_dashboard(admin_client, monkeypatch):
     def fail_to_initialize(**kwargs):
@@ -483,13 +690,27 @@ def test_diagnose_and_remediate_workflow(admin_client, monkeypatch):
         f"/api/remediate/{inc_id}",
         json={"approved": False},
     ).status_code == 422
+    assert client.post(
+        f"/api/remediate/{inc_id}",
+        json={"approved": True, "diagnostic_run_id": "unverified-run-id-0001"},
+    ).status_code == 409
+    diagnostic_res = client.post(f"/api/incidents/{inc_id}/diagnose")
+    assert diagnostic_res.status_code == 200
+    diagnostics = diagnostic_res.json()["diagnostics"]
+    assert diagnostics["status"] == "SIMULATION_ONLY"
+    assert diagnostics["run_id"]
     rem_res = client.post(
         f"/api/remediate/{inc_id}",
-        json={"approved": True},
+        json={"approved": True, "diagnostic_run_id": diagnostics["run_id"]},
     )
     assert rem_res.status_code == 200
     assert rem_res.json()["remediation"]["executed"] is False
     assert rem_res.json()["remediation"]["status"] == "SIMULATION_ONLY"
+    assert rem_res.json()["post_check"]["status"] == "SIMULATION_ONLY"
+
+    listed = next(item for item in client.get("/api/incidents").json() if item["id"] == inc_id)
+    assert listed["diagnostic_report"]["run_id"] == diagnostics["run_id"]
+    assert listed["remediation_report"]["status"] == "SIMULATION_ONLY"
 
 
 def test_slack_notification_runs_as_background_task(admin_client, monkeypatch):

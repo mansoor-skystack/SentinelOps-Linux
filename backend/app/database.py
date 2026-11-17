@@ -48,7 +48,13 @@ class IncidentRecord(Base):
     risk_level = Column(String(20), default="SAFE")
     status = Column(String(20), default="PENDING", nullable=False, server_default="PENDING")
     citations = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    diagnostic_report = Column(Text)
+    remediation_report = Column(Text)
+    post_check_report = Column(Text)
+    remediation_approved_at = Column(DateTime)
+    remediation_approved_by = Column(String(120))
+    correlation_id = Column(Integer, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 class VisitorLog(Base):
     __tablename__ = "visitor_logs"
@@ -83,13 +89,32 @@ def init_db():
         "referrer": "VARCHAR(250) DEFAULT 'Direct'",
         "accept_language": "VARCHAR(100) DEFAULT 'Unknown'",
     }
+    incident_additions = {
+        "diagnostic_report": "TEXT",
+        "remediation_report": "TEXT",
+        "post_check_report": "TEXT",
+        "remediation_approved_at": "TIMESTAMP",
+        "remediation_approved_by": "VARCHAR(120)",
+        "correlation_id": "INTEGER",
+    }
     with engine.begin() as connection:
         if "status" not in incident_columns:
             connection.execute(
                 text("ALTER TABLE incident_records ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'PENDING'")
             )
+        for name, definition in incident_additions.items():
+            if name not in incident_columns:
+                connection.execute(
+                    text(f"ALTER TABLE incident_records ADD COLUMN {name} {definition}")
+                )
         for name, definition in additions.items():
             if name not in visitor_columns:
                 connection.execute(
                     text(f"ALTER TABLE visitor_logs ADD COLUMN {name} {definition}")
                 )
+        connection.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_incident_records_correlation_id ON incident_records (correlation_id)")
+        )
+        connection.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_incident_records_created_at ON incident_records (created_at)")
+        )

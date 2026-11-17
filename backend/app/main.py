@@ -4,6 +4,8 @@ import hmac
 import ipaddress
 import logging
 import re
+import uuid
+from datetime import datetime, timedelta
 from typing import Dict, Literal, Optional
 import requests
 from urllib.parse import urlsplit
@@ -11,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Request, B
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import func, or_
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -221,6 +224,68 @@ class IncidentStatusUpdate(BaseModel):
 
 class RemediationApproval(BaseModel):
     approved: Literal[True]
+    diagnostic_run_id: str = Field(..., min_length=16, max_length=64)
+
+_CORRELATION_STOP_WORDS = {
+    "about", "after", "because", "before", "being", "cause", "could", "error",
+    "failed", "failure", "from", "host", "issue", "linux", "process", "service",
+    "system", "systemd", "that", "there", "this", "unable", "with",
+}
+
+def _correlation_terms(root_cause: str, sanitized_log: str) -> set[str]:
+    text = f"{root_cause} {sanitized_log}".lower()
+    text = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b\d+\b", " ", text)
+    return {
+        term for term in re.findall(r"[a-z][a-z0-9_-]{2,}", text)
+        if term not in _CORRELATION_STOP_WORDS
+    }
+
+def _incidents_are_correlated(first: IncidentRecord, second: IncidentRecord) -> bool:
+    if (
+        (first.hostname or "").strip().lower() == (second.hostname or "").strip().lower()
+        or (first.stack_tag or "").strip().lower() != (second.stack_tag or "").strip().lower()
+    ):
+        return False
+    first_terms = _correlation_terms(first.root_cause or "", first.sanitized_log or "")
+    second_terms = _correlation_terms(second.root_cause or "", second.sanitized_log or "")
+    shared = first_terms & second_terms
+    union = first_terms | second_terms
+    return len(shared) >= 2 and len(shared) / max(1, len(union)) >= 0.5
+
+def _correlate_incident(db, incident: IncidentRecord) -> tuple[Optional[int], int]:
+    cutoff = incident.created_at - timedelta(minutes=5)
+    candidates = (
+        db.query(IncidentRecord)
+        .filter(
+            IncidentRecord.id != incident.id,
+            IncidentRecord.created_at >= cutoff,
+            IncidentRecord.created_at <= incident.created_at,
+        )
+        .all()
+    )
+    matching = [candidate for candidate in candidates if _incidents_are_correlated(incident, candidate)]
+    if not matching:
+        return None, 1
+
+    group_ids = {row.correlation_id or row.id for row in matching}
+    group_id = min(group_ids)
+    affected = (
+        db.query(IncidentRecord)
+        .filter(
+            or_(
+                IncidentRecord.id.in_(group_ids),
+                IncidentRecord.correlation_id.in_(group_ids),
+            )
+        )
+        .all()
+    )
+    hosts = {incident.hostname}
+    for row in affected:
+        row.correlation_id = group_id
+        hosts.add(row.hostname)
+    incident.correlation_id = group_id
+    db.commit()
+    return group_id, len(hosts)
 
 def process_incident(
     raw_log: str,
@@ -259,6 +324,7 @@ def process_incident(
         db.add(rec)
         db.commit()
         db.refresh(rec)
+        correlation_id, correlated_hosts = _correlate_incident(db, rec)
         inc_id = rec.id
 
         alert_args = {
@@ -283,7 +349,9 @@ def process_incident(
         "sanitized_log": sanitized,
         "redactions": redactions,
         "noise_lines_dropped": dropped,
-        "diagnosis": diagnosis
+        "diagnosis": diagnosis,
+        "correlation_id": correlation_id,
+        "correlated_hosts": correlated_hosts,
     }
 
 @app.get("/", response_class=HTMLResponse)
@@ -392,6 +460,21 @@ def list_recent_incidents(
         if limit is not None:
             query = query.limit(limit)
         rows = query.all()
+        group_ids = {row.correlation_id for row in rows if row.correlation_id is not None}
+        group_sizes = {}
+        if group_ids:
+            group_sizes = {
+                group_id: host_count
+                for group_id, host_count in (
+                    db.query(
+                        IncidentRecord.correlation_id,
+                        func.count(func.distinct(IncidentRecord.hostname)),
+                    )
+                    .filter(IncidentRecord.correlation_id.in_(group_ids))
+                    .group_by(IncidentRecord.correlation_id)
+                    .all()
+                )
+            }
         return [
             {
                 "id": r.id,
@@ -407,6 +490,16 @@ def list_recent_incidents(
                 "fix_commands": json.loads(r.fix_commands or "[]"),
                 "risk_level": r.risk_level,
                 "status": r.status,
+                "correlation_id": r.correlation_id,
+                "correlated_hosts": group_sizes.get(r.correlation_id, 1),
+                "diagnostic_report": json.loads(r.diagnostic_report or "null"),
+                "remediation_report": json.loads(r.remediation_report or "null"),
+                "post_check_report": json.loads(r.post_check_report or "null"),
+                "remediation_approved_at": (
+                    r.remediation_approved_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    if r.remediation_approved_at else None
+                ),
+                "remediation_approved_by": r.remediation_approved_by,
                 "citations": json.loads(r.citations or "[]"),
                 "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
             }
@@ -465,6 +558,7 @@ def export_postmortem(incident_id: int, _: None = Depends(auth.require_admin)):
 - **Stack Domain:** {r.stack_tag}
 - **Telemetry Snapshot:** CPU Load: {r.cpu_load} | RAM Used: {r.mem_used_pct}% | Disk Used: {r.disk_used_pct}%
 - **Command Safety Rating:** {r.risk_level}
+- **Correlation Group:** {r.correlation_id or "None"}
 
 ## 1. Sanitized Terminal Error Log
 ```text
@@ -486,11 +580,49 @@ def export_postmortem(incident_id: int, _: None = Depends(auth.require_admin)):
 
 ## 5. Grounded Runbook Citations
 {cites}
+
+## 6. Read-only Diagnostic Execution
+{json.dumps(json.loads(r.diagnostic_report or "null"), indent=2)}
+
+## 7. Remediation Approval and Execution
+- **Approved by:** {r.remediation_approved_by or "Not approved"}
+- **Approved at:** {r.remediation_approved_at.strftime('%Y-%m-%d %H:%M:%S UTC') if r.remediation_approved_at else "Not approved"}
+{json.dumps(json.loads(r.remediation_report or "null"), indent=2)}
+
+## 8. Post-remediation Health Check
+{json.dumps(json.loads(r.post_check_report or "null"), indent=2)}
 """
     finally:
         db.close()
 
 from .remediator import SSHRemediationEngine
+
+@app.post("/api/incidents/{incident_id}/diagnose")
+def run_incident_diagnostics(
+    incident_id: int,
+    _: None = Depends(auth.require_admin),
+):
+    db = SessionLocal()
+    try:
+        rec = db.query(IncidentRecord).filter(IncidentRecord.id == incident_id).first()
+        if not rec:
+            raise HTTPException(status_code=404, detail="Incident record not found")
+        commands = json.loads(rec.diagnostic_commands or "[]")
+        if not commands:
+            raise HTTPException(status_code=400, detail="No diagnostic commands associated with this incident")
+
+        report = SSHRemediationEngine.execute_diagnostics(rec.hostname, commands)
+        report["run_id"] = uuid.uuid4().hex
+        report["created_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        rec.diagnostic_report = json.dumps(report)
+        rec.remediation_report = None
+        rec.post_check_report = None
+        rec.remediation_approved_at = None
+        rec.remediation_approved_by = None
+        db.commit()
+        return {"incident_id": rec.id, "diagnostics": report}
+    finally:
+        db.close()
 
 @app.post("/api/remediate/{incident_id}")
 def approve_and_remediate(
@@ -508,15 +640,49 @@ def approve_and_remediate(
         if not commands:
             raise HTTPException(status_code=400, detail="No remediation commands associated with this incident")
 
+        diagnostic_report = json.loads(rec.diagnostic_report or "null")
+        if (
+            not isinstance(diagnostic_report, dict)
+            or diagnostic_report.get("run_id") != approval.diagnostic_run_id
+            or diagnostic_report.get("status") not in {"COMPLETED", "SIMULATION_ONLY"}
+        ):
+            raise HTTPException(status_code=409, detail="Run read-only diagnostics before approving this fix")
+        if (
+            os.getenv("SSH_REMEDIATION_ENABLED", "").strip().lower() == "true"
+            and not diagnostic_report.get("executed")
+        ):
+            raise HTTPException(status_code=409, detail="Live fixes require successfully executed diagnostics")
+
         execution_report = SSHRemediationEngine.execute_fix(
             hostname=rec.hostname,
             commands=commands,
             risk_level=rec.risk_level
         )
+        post_check_report = {
+            "executed": False,
+            "status": "NOT_RUN",
+            "outputs": [],
+        }
+        if execution_report.get("executed"):
+            post_check_report = SSHRemediationEngine.execute_post_check(rec.hostname)
+            if post_check_report.get("status") == "HEALTHY":
+                rec.status = "COMPLETED"
+        elif execution_report.get("status") == "SIMULATION_ONLY":
+            post_check_report["status"] = "SIMULATION_ONLY"
+
+        approved_at = datetime.utcnow()
+        rec.remediation_approved_at = approved_at
+        rec.remediation_approved_by = "authenticated-admin-session"
+        rec.remediation_report = json.dumps(execution_report)
+        rec.post_check_report = json.dumps(post_check_report)
+        db.commit()
         return {
             "incident_id": rec.id,
             "hostname": rec.hostname,
-            "remediation": execution_report
+            "remediation": execution_report,
+            "post_check": post_check_report,
+            "approved_at": approved_at.isoformat(timespec="seconds") + "Z",
+            "approved_by": rec.remediation_approved_by,
         }
     finally:
         db.close()

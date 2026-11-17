@@ -47,7 +47,9 @@
       const [runbookFile, setRunbookFile] = useState(null);
       const [runbookMessage, setRunbookMessage] = useState("");
       const [remediatingIncidentId, setRemediatingIncidentId] = useState(null);
+      const [diagnosingIncidentId, setDiagnosingIncidentId] = useState(null);
       const [updatingIncidentStatusId, setUpdatingIncidentStatusId] = useState(null);
+      const [diagnosticResults, setDiagnosticResults] = useState({});
       const [remediationResults, setRemediationResults] = useState({});
       const [selectedIncidentId, setSelectedIncidentId] = useState(null);
       const [copied, setCopied] = useState(false);
@@ -210,8 +212,14 @@
       const handleRemediate = async (incident) => {
         const commands = incident.fix_commands || [];
         if (!commands.length) return;
+        const diagnostics = diagnosticResults[incident.id] || incident.diagnostic_report;
+        if (!diagnostics || !diagnostics.run_id || !["COMPLETED", "SIMULATION_ONLY"].includes(diagnostics.status)) {
+          setErrorMsg("Run successful read-only diagnostics before approving fixes.");
+          return;
+        }
         const approvalMessage = [
           `Admin approval required for incident #${incident.id} on ${incident.hostname}.`,
+          "Review the recorded read-only diagnostic output before proceeding.",
           "Review and approve these exact proposed commands:",
           ...commands.map((command) => `- ${command}`),
           "",
@@ -225,15 +233,54 @@
             method: "POST",
             credentials: "same-origin",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ approved: true })
+            body: JSON.stringify({ approved: true, diagnostic_run_id: diagnostics.run_id })
           });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || `Remediation failed (HTTP ${res.status})`);
-          setRemediationResults((current) => ({ ...current, [incident.id]: data.remediation }));
+          const result = {
+            ...data.remediation,
+            post_check: data.post_check,
+            approved_at: data.approved_at,
+            approved_by: data.approved_by
+          };
+          setRemediationResults((current) => ({ ...current, [incident.id]: result }));
+          setIncidents((current) => current.map((item) =>
+            item.id === incident.id
+              ? {
+                  ...item,
+                  remediation_report: data.remediation,
+                  post_check_report: data.post_check,
+                  remediation_approved_at: data.approved_at,
+                  remediation_approved_by: data.approved_by,
+                  status: data.post_check.status === "HEALTHY" ? "COMPLETED" : item.status
+                }
+              : item
+          ));
         } catch (error) {
           setErrorMsg(error.message);
         } finally {
           setRemediatingIncidentId(null);
+        }
+      };
+
+      const handleDiagnostics = async (incident) => {
+        setDiagnosingIncidentId(incident.id);
+        setErrorMsg(null);
+        try {
+          const res = await fetch(`/api/incidents/${incident.id}/diagnose`, {
+            method: "POST",
+            credentials: "same-origin"
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || `Diagnostics failed (HTTP ${res.status})`);
+          setDiagnosticResults((current) => ({ ...current, [incident.id]: data.diagnostics }));
+          setIncidents((current) => current.map((item) =>
+            item.id === incident.id ? { ...item, diagnostic_report: data.diagnostics } : item
+          ));
+        } catch (error) {
+          setErrorMsg(error.message);
+        } finally {
+          setDiagnosingIncidentId(null);
         }
       };
 
@@ -843,6 +890,11 @@
                 <div className="mt-5 space-y-4">
                   <section>
                     <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400">Root cause</h3>
+                    {selectedIncident.correlated_hosts > 1 && (
+                      <p className="mt-2 rounded-lg border border-cyan-800/70 bg-cyan-950/30 p-2 text-xs text-cyan-200">
+                        Correlated incident group #{selectedIncident.correlation_id}: {selectedIncident.correlated_hosts} hosts affected within five minutes.
+                      </p>
+                    )}
                     <p className="mt-2 rounded-lg bg-[#080d17] p-3 text-sm leading-relaxed text-slate-200">{selectedIncident.root_cause || "No root-cause analysis was stored."}</p>
                   </section>
                   <section>
@@ -852,6 +904,26 @@
                   <section>
                     <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400">Diagnostic commands</h3>
                     <pre className="mt-2 overflow-auto whitespace-pre-wrap rounded-lg bg-[#080d17] p-3 font-mono text-xs text-slate-300">{(selectedIncident.diagnostic_commands || []).join("\n") || "No diagnostic commands were stored."}</pre>
+                    <div className="mt-2 flex flex-wrap items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() => handleDiagnostics(selectedIncident)}
+                        disabled={diagnosingIncidentId === selectedIncident.id || !(selectedIncident.diagnostic_commands || []).length}
+                        className="rounded-lg border border-cyan-700/70 bg-cyan-950/40 px-3 py-2 text-xs font-semibold text-cyan-100 hover:bg-cyan-900/50 disabled:opacity-50"
+                      >
+                        {diagnosingIncidentId === selectedIncident.id ? "Checking..." : "Run Read-only Diagnostics"}
+                      </button>
+                      {(diagnosticResults[selectedIncident.id] || selectedIncident.diagnostic_report) && (
+                        <span className="text-xs text-slate-400">
+                          {(diagnosticResults[selectedIncident.id] || selectedIncident.diagnostic_report).status}
+                        </span>
+                      )}
+                    </div>
+                    {(diagnosticResults[selectedIncident.id] || selectedIncident.diagnostic_report) && (
+                      <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-[#080d17] p-3 font-mono text-xs text-slate-300">
+                        {JSON.stringify((diagnosticResults[selectedIncident.id] || selectedIncident.diagnostic_report).outputs || [], null, 2)}
+                      </pre>
+                    )}
                   </section>
                   <section>
                     <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400">Proposed fix commands</h3>
@@ -869,8 +941,19 @@
                     <section>
                       <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400">Remediation result</h3>
                       <p className="mt-2 text-sm text-slate-200">{remediationResults[selectedIncident.id].status}</p>
+                      <p className="mt-1 text-xs text-slate-400">Approved by {remediationResults[selectedIncident.id].approved_by} at {remediationResults[selectedIncident.id].approved_at}</p>
                       {remediationResults[selectedIncident.id].reason && <p className="mt-1 text-xs text-amber-200">{remediationResults[selectedIncident.id].reason}</p>}
                       <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-[#080d17] p-3 font-mono text-xs text-slate-300">{JSON.stringify(remediationResults[selectedIncident.id].outputs || [], null, 2)}</pre>
+                      <p className="mt-2 text-xs text-slate-300">Post-fix health: {remediationResults[selectedIncident.id].post_check?.status || selectedIncident.post_check_report?.status || "Not run"}</p>
+                    </section>
+                  )}
+                  {!remediationResults[selectedIncident.id] && selectedIncident.remediation_report && (
+                    <section>
+                      <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400">Remediation audit</h3>
+                      <p className="mt-2 text-sm text-slate-200">{selectedIncident.remediation_report.status}</p>
+                      <p className="mt-1 text-xs text-slate-400">Approved by {selectedIncident.remediation_approved_by} at {selectedIncident.remediation_approved_at}</p>
+                      <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-[#080d17] p-3 font-mono text-xs text-slate-300">{JSON.stringify(selectedIncident.remediation_report.outputs || [], null, 2)}</pre>
+                      <p className="mt-2 text-xs text-slate-300">Post-fix health: {selectedIncident.post_check_report?.status || "Not run"}</p>
                     </section>
                   )}
 
@@ -882,7 +965,12 @@
                       <button
                         type="button"
                         onClick={() => handleRemediate(selectedIncident)}
-                        disabled={remediatingIncidentId === selectedIncident.id}
+                        disabled={
+                          remediatingIncidentId === selectedIncident.id ||
+                          !["COMPLETED", "SIMULATION_ONLY"].includes(
+                            (diagnosticResults[selectedIncident.id] || selectedIncident.diagnostic_report)?.status
+                          )
+                        }
                         className="rounded-lg border border-amber-600/70 bg-amber-900/50 px-4 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-800/60 disabled:opacity-50"
                       >
                         {remediatingIncidentId === selectedIncident.id ? "Running..." : "Approve & Run Fixes"}

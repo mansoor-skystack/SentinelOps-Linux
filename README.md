@@ -14,7 +14,9 @@ Agent webhooks also pass CPU load, memory usage, and disk usage into model-backe
 
 The dashboard separates **Manual Logs** from **VM Agent Logs**. Incidents start as **Pending**; admins can mark an issue **Completed** after addressing it or return it to **Pending**. Resolution status is stored with the incident.
 
-The VM collector only submits logs and telemetry; it never runs the suggested fixes. Admins can open an incident's details to review the diagnosis, verification commands, proposed fixes, and runbook citations. Running fixes requires an authenticated admin to explicitly approve the displayed commands, and SSH allowlists and safety checks still apply.
+The VM collector only submits logs and telemetry; it never runs the suggested fixes. Admins can run exact-allowlisted read-only diagnostics and inspect their output before explicitly approving the proposed fixes. A fix is followed by configured health checks; SentinelOps marks it completed automatically only when those checks pass. Execution reports and approval time are retained with the incident.
+
+The curated incident runbooks in `backend/data/runbooks/` are indexed separately from the public TLDR command references in `backend/data/public-reference/tldr/`. Public references can help with command context, but they are weighted as lower-trust retrieval material and cannot authorize offline fix commands. Cross-host correlation is a five-minute lexical signal for shared symptoms, not proof of a common root cause.
 
 ## VS Code Quickstart
 1. Extract this archive and double-click **`SentinelOps-Linux.code-workspace`** in **VS Code** (or run `code SentinelOps-Linux/SentinelOps-Linux.code-workspace`).
@@ -29,6 +31,7 @@ The VM collector only submits logs and telemetry; it never runs the suggested fi
    python scripts/evaluate_system.py
    uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
    ```
+   The evaluation reports development and held-out Hit@3/MRR, index-build duration, p95 retrieval latency, and synthetic sanitizer cases separately.
    The VS Code workspace is configured to use and activate this project-local virtual environment. If `python` is not recognized before creating it on Windows, run the installed interpreter by its full path (for example, `& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m venv venv`; adjust the version/path to match your installation). Once the environment exists, open a new VS Code terminal or activate it with `.\venv\Scripts\Activate.ps1`.
 4. Open `http://localhost:8000` in your browser, or press **`F5`** in VS Code to launch with the preconfigured debugger profiles in `.vscode/launch.json`.
 
@@ -41,7 +44,8 @@ The VM collector only submits logs and telemetry; it never runs the suggested fi
 - Frontend CDN scripts are pinned to fixed versions with Subresource Integrity. For production builds, bundle/precompile the dashboard to remove runtime CDN and Babel dependencies.
 - Visitor IP addresses are sent to ipapi.co over HTTPS for geolocation. Disclose this processing and apply an appropriate retention policy.
 - Successful visitor location lookups are reused from the database for later visits from the same IP address.
-- Live SSH remediation is disabled by default. To enable it, configure exact `SSH_ALLOWED_HOSTS` and `SSH_ALLOWED_COMMANDS` as a JSON array of exact command strings, a dedicated SSH user/private key, and a pinned `SSH_KNOWN_HOSTS` file. Do not enable it for broad host sets or AI-generated commands that are not in the exact allowlist.
+- Live SSH remediation is disabled by default. To enable it, configure exact `SSH_ALLOWED_HOSTS`, `SSH_ALLOWED_DIAGNOSTIC_COMMANDS`, `SSH_ALLOWED_COMMANDS`, and `SSH_ALLOWED_POSTCHECK_COMMANDS` as comma-separated hosts and JSON arrays of exact command strings, a dedicated SSH user/private key, and a pinned `SSH_KNOWN_HOSTS` file. Diagnostics and post-checks must be single read-only commands without shell operators. Do not enable it for broad host sets or AI-generated commands that are not in the exact allowlist. Successful fixes are not marked complete unless all configured post-checks pass.
+- The collector raises proactive alerts at 90% by default for sampled CPU utilization, memory, and disk. CPU utilization is measured from `/proc/stat`; the separate `cpu_load` telemetry remains a one-minute load average. Configure `SENTINELOPS_CPU_THRESHOLD_PCT`, `SENTINELOPS_MEMORY_THRESHOLD_PCT`, and `SENTINELOPS_DISK_THRESHOLD_PCT`; a five-point clear margin and five-minute cooldown suppress alert flapping. Threshold state is stored beside the journal cursor under the service state directory.
 - To install and run the Linux collector, follow [Deploy the Linux collector agent](#deploy-the-linux-collector-agent). Keep its API key in the protected environment file, not in the service unit or repository.
 - Admin sign-in allows five failed attempts per client IP in a five-minute window. This in-memory limit is per app process; use an edge/reverse-proxy limit as well, especially with multiple app instances.
 
@@ -87,10 +91,13 @@ Run these steps on each Linux host you want to monitor. The collector sends tele
      /etc/sentinelops/collector.env
    sudoedit /etc/sentinelops/collector.env
    ```
-   Add the backend URL and the exact same API key configured as `SENTINELOPS_API_KEY` in the Render Web Service:
+   Add the backend URL, the exact same API key configured as `SENTINELOPS_API_KEY` in the Render Web Service, and optionally override the default proactive thresholds:
    ```ini
    SENTINELOPS_URL=https://sentinelops-linux.onrender.com
    SENTINELOPS_API_KEY=replace_with_the_same_key_configured_in_Render
+   SENTINELOPS_CPU_THRESHOLD_PCT=90
+   SENTINELOPS_MEMORY_THRESHOLD_PCT=90
+   SENTINELOPS_DISK_THRESHOLD_PCT=90
    ```
    Replace the placeholder with the real key; do not include quotes or commit this file. The collector appends `/api/webhook/ingest` to the base URL. Keep the file owned by `root:sentinelops` with mode `640`.
 

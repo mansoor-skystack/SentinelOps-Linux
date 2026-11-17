@@ -1,0 +1,160 @@
+[
+  {
+    "id": "H01",
+    "stack": "Linux",
+    "query": "Use journalctl to display the latest error messages from a systemd unit since the previous boot",
+    "expected_source": "tldr/journalctl.md"
+  },
+  {
+    "id": "H02",
+    "stack": "Linux",
+    "query": "Run ss -ltp to identify the process and PID listening on TCP port 8080",
+    "expected_source": "tldr/ss.md",
+    "expected_sources": ["tldr/ss.md", "linux-systemd-man.md"]
+  },
+  {
+    "id": "H03",
+    "stack": "Linux",
+    "query": "Use ip address show to list IPv4 addresses assigned to active network interfaces",
+    "expected_source": "tldr/ip-address.md"
+  },
+  {
+    "id": "H04",
+    "stack": "Linux",
+    "query": "Run df -h to display filesystem capacity and available disk space in human-readable units",
+    "expected_source": "tldr/df.md"
+  },
+  {
+    "id": "H05",
+    "stack": "Linux",
+    "query": "Run free -h to inspect available RAM, used memory, and swap",
+    "expected_source": "tldr/free.md",
+    "expected_sources": ["tldr/free.md", "linux-memory-oom.md"]
+  },
+  {
+    "id": "H06",
+    "stack": "Linux",
+    "query": "Use the interactive top command to view running processes and CPU and memory consumption",
+    "expected_source": "tldr/top.md"
+  },
+  {
+    "id": "H07",
+    "stack": "Linux",
+    "query": "Read kernel ring buffer messages to investigate hardware or boot errors",
+    "expected_source": "tldr/dmesg.md"
+  },
+  {
+    "id": "H08",
+    "stack": "Linux",
+    "query": "Run systemd-analyze critical-chain to show the critical boot startup path",
+    "expected_source": "tldr/systemd-analyze.md"
+  },
+  {
+    "id": "H09",
+    "stack": "Linux",
+    "query": "Run lsblk -f to list block devices, partitions, filesystems, and mount points",
+    "expected_source": "tldr/lsblk.md"
+  },
+  {
+    "id": "H10",
+    "stack": "Linux",
+    "query": "Display currently mounted filesystems and mount options",
+    "expected_source": "tldr/mount.md"
+  },
+  {
+    "id": "H11",
+    "stack": "Linux",
+    "query": "Run fuser -v 8080/tcp to identify the process using a TCP port",
+    "expected_source": "tldr/fuser.md"
+  },
+  {
+    "id": "H12",
+    "stack": "Docker",
+    "query": "List running and stopped Docker containers and inspect their status",
+    "expected_source": "tldr/docker.md"
+  },
+  {
+    "id": "H13",
+    "stack": "Linux",
+    "query": "Refresh the APT package index and upgrade installed packages on Debian",
+    "expected_source": "tldr/apt.md"
+  },
+  {
+    "id": "H14",
+    "stack": "Linux",
+    "query": "Use ssh -i key.pem user@host to connect to a remote Linux host with a private key",
+    "expected_source": "tldr/ssh.md",
+    "expected_sources": ["tldr/ssh.md", "ssh-systemd-security.md"]
+  },
+  {
+    "id": "H15",
+    "stack": "Linux",
+    "query": "Run curl -I https://example.invalid to inspect HTTP response headers",
+    "expected_source": "tldr/curl.md"
+  },
+  {
+    "id": "H16",
+    "stack": "Linux",
+    "query": "Run hostnamectl to display the machine hostname and operating system details",
+    "expected_source": "tldr/hostnamectl.md"
+  },
+  {
+    "id": "H17",
+    "stack": "Linux",
+    "query": "Check uncomplicated firewall status and list configured UFW rules",
+    "expected_source": "tldr/ufw.md"
+  },
+  {
+    "id": "H18",
+    "stack": "Linux",
+    "query": "Use systemctl --failed to list failed systemd units",
+    "expected_source": "tldr/systemctl.md",
+    "expected_sources": ["tldr/systemctl.md", "linux-systemd-man.md"]
+  },
+  {
+    "id": "H19",
+    "stack": "Linux",
+    "query": "Run df -i to inspect free inodes on mounted filesystems",
+    "expected_source": "tldr/df.md"
+  },
+  {
+    "id": "H20",
+    "stack": "Linux",
+    "query": "Run dmesg -T to inspect recent kernel ring-buffer messages with human timestamps",
+    "expected_source": "tldr/dmesg.md",
+    "expected_sources": ["tldr/dmesg.md", "linux-memory-oom.md"]
+  },
+  {
+    "id": "H21",
+    "stack": "Linux",
+    "query": "Run systemctl status nginx.service to inspect a systemd unit's status",
+    "expected_source": "tldr/systemctl-status.md",
+    "expected_sources": ["tldr/systemctl-status.md", "linux-systemd-man.md"]
+  },
+  {
+    "id": "H22",
+    "stack": "Linux",
+    "query": "Use free -m to check memory and swap statistics from the terminal",
+    "expected_source": "tldr/free.md",
+    "expected_sources": ["tldr/free.md", "linux-memory-oom.md"]
+  },
+  {
+    "id": "H23",
+    "stack": "Linux",
+    "query": "Run ip route show to inspect the machine's routing table and default gateway",
+    "expected_source": "tldr/ip-route.md"
+  },
+  {
+    "id": "H24",
+    "stack": "Linux",
+    "query": "Run systemd-analyze blame to find systemd services that start slowly during boot",
+    "expected_source": "tldr/systemd-analyze.md"
+  },
+  {
+    "id": "H25",
+    "stack": "Linux",
+    "query": "Run ss -ltnp to list listening TCP sockets with process names and port numbers",
+    "expected_source": "tldr/ss.md",
+    "expected_sources": ["tldr/ss.md", "linux-systemd-man.md"]
+  }
+]

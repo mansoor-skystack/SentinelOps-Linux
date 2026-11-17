@@ -12,6 +12,7 @@ import argparse
 import time
 import json
 import requests
+from typing import Any, Dict, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 SIMULATED_CRASHES = {
@@ -65,6 +66,29 @@ def collect_system_metrics():
         mem_pct = round(((mem_total - mem_avail) / mem_total) * 100, 1)
 
     return hostname, cpu_load, mem_pct, disk_pct
+
+def _read_cpu_counters():
+    with open("/proc/stat", "r", encoding="utf-8") as stat_file:
+        cpu_line = stat_file.readline().split()
+    if not cpu_line or cpu_line[0] != "cpu":
+        raise ValueError("CPU counters are missing from /proc/stat")
+    values = [int(value) for value in cpu_line[1:]]
+    if len(values) < 4:
+        raise ValueError("CPU counters in /proc/stat are incomplete")
+    return sum(values[:8]), values[3] + (values[4] if len(values) > 4 else 0)
+
+def collect_cpu_utilization_pct(interval: float = 0.1) -> Optional[float]:
+    try:
+        total_before, idle_before = _read_cpu_counters()
+        time.sleep(interval)
+        total_after, idle_after = _read_cpu_counters()
+    except (OSError, ValueError):
+        return None
+    total_delta = total_after - total_before
+    idle_delta = idle_after - idle_before
+    if total_delta <= 0 or idle_delta < 0:
+        return None
+    return round(max(0.0, min(100.0, 100.0 * (total_delta - idle_delta) / total_delta)), 1)
 
 def collect_live_journal_errors() -> str:
     try:
@@ -134,6 +158,107 @@ def _save_journal_cursor(path: str, cursor: str) -> None:
         cursor_file.write(cursor)
     os.replace(temporary_path, path)
 
+def _threshold_state_path(cursor_path: str) -> str:
+    configured_path = os.getenv("SENTINELOPS_THRESHOLD_STATE_FILE", "").strip()
+    return os.path.expanduser(configured_path) if configured_path else f"{cursor_path}.thresholds.json"
+
+def _load_threshold_state(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except FileNotFoundError:
+        return {"active": [], "last_alert_at": {}}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Unable to read threshold state ({type(exc).__name__})") from exc
+    if (
+        not isinstance(state, dict)
+        or not isinstance(state.get("active", []), list)
+        or not isinstance(state.get("last_alert_at", {}), dict)
+    ):
+        raise RuntimeError("Threshold state file has an invalid structure")
+    return {
+        "active": [name for name in state.get("active", []) if isinstance(name, str)],
+        "last_alert_at": {
+            name: timestamp
+            for name, timestamp in state.get("last_alert_at", {}).items()
+            if isinstance(name, str) and isinstance(timestamp, (int, float))
+        },
+    }
+
+def _save_threshold_state(path: str, state: Dict[str, Any]) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temporary_path = f"{path}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as state_file:
+        json.dump(state, state_file, sort_keys=True)
+    os.replace(temporary_path, path)
+
+def _threshold_configuration() -> Dict[str, Any]:
+    limits = {}
+    for metric, environment_variable, default, maximum in (
+        ("cpu_used_pct", "SENTINELOPS_CPU_THRESHOLD_PCT", 90.0, 100.0),
+        ("mem_used_pct", "SENTINELOPS_MEMORY_THRESHOLD_PCT", 90.0, 100.0),
+        ("disk_used_pct", "SENTINELOPS_DISK_THRESHOLD_PCT", 90.0, 100.0),
+    ):
+        try:
+            value = float(os.getenv(environment_variable, str(default)))
+        except ValueError as exc:
+            raise RuntimeError(f"{environment_variable} must be a number") from exc
+        if not 0 < value <= maximum:
+            raise RuntimeError(f"{environment_variable} must be greater than 0 and at most {maximum:g}")
+        limits[metric] = value
+    try:
+        clear_margin = float(os.getenv("SENTINELOPS_THRESHOLD_CLEAR_MARGIN_PCT", "5"))
+        cooldown = int(os.getenv("SENTINELOPS_THRESHOLD_COOLDOWN_SECONDS", "300"))
+    except ValueError as exc:
+        raise RuntimeError("Threshold clear margin and cooldown must be numeric") from exc
+    if not 0 <= clear_margin < 100 or not 0 <= cooldown <= 86400:
+        raise RuntimeError("Threshold clear margin must be 0-99 and cooldown 0-86400 seconds")
+    return {"limits": limits, "clear_margin_pct": clear_margin, "cooldown_seconds": cooldown}
+
+def detect_threshold_alerts(
+    cpu_used_pct: Optional[float],
+    mem_pct: float,
+    disk_pct: float,
+    state: Dict[str, Any],
+    *,
+    configuration: Optional[Dict[str, Any]] = None,
+    now: Optional[float] = None,
+):
+    config = configuration or _threshold_configuration()
+    timestamp = time.time() if now is None else now
+    readings = {
+        "mem_used_pct": mem_pct,
+        "disk_used_pct": disk_pct,
+    }
+    if cpu_used_pct is not None:
+        readings["cpu_used_pct"] = cpu_used_pct
+    active = set(state.get("active", []))
+    last_alert_at = dict(state.get("last_alert_at", {}))
+    labels = {
+        "cpu_used_pct": "CPU usage",
+        "mem_used_pct": "memory usage",
+        "disk_used_pct": "disk usage",
+    }
+    alerts = []
+    for metric, value in readings.items():
+        limit = config["limits"][metric]
+        if metric in active:
+            if value < limit - config["clear_margin_pct"]:
+                active.remove(metric)
+            continue
+        if value < limit:
+            continue
+        last_sent = float(last_alert_at.get(metric, 0.0))
+        if timestamp - last_sent < config["cooldown_seconds"]:
+            active.add(metric)
+            continue
+        alerts.append(f"{labels[metric]} is {value:.1f}% (threshold {limit:.1f}%).")
+        active.add(metric)
+        last_alert_at[metric] = timestamp
+    return alerts, {"active": sorted(active), "last_alert_at": last_alert_at}
+
 def _webhook_config():
     backend_url = (os.getenv("SENTINELOPS_URL") or os.getenv("SENTINELOPS_API_URL") or "").strip()
     api_key = os.getenv("SENTINELOPS_API_KEY", "").strip()
@@ -157,9 +282,15 @@ def _webhook_config():
     endpoint = urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
     return endpoint, api_key
 
-def ship_alert(raw_log: str, stack_tag: str = "Linux"):
+def ship_alert(raw_log: str, stack_tag: str = "Linux", telemetry: Optional[Dict[str, Any]] = None):
     api_endpoint, api_key = _webhook_config()
-    hostname, cpu_load, mem_pct, disk_pct = collect_system_metrics()
+    if telemetry is None:
+        hostname, cpu_load, mem_pct, disk_pct = collect_system_metrics()
+    else:
+        hostname = telemetry["hostname"]
+        cpu_load = telemetry["cpu_load"]
+        mem_pct = telemetry["mem_used_pct"]
+        disk_pct = telemetry["disk_used_pct"]
     payload = {
         "hostname": hostname,
         "stack_tag": stack_tag,
@@ -200,11 +331,32 @@ if __name__ == "__main__":
         print(f"Starting SentinelOps Linux Collector Daemon (polling every {args.interval}s)...")
         cursor_path = _journal_cursor_path()
         cursor = _load_journal_cursor(cursor_path)
+        threshold_path = _threshold_state_path(cursor_path)
+        threshold_state = _load_threshold_state(threshold_path)
+        threshold_configuration = _threshold_configuration()
         while True:
             logs, next_cursor = collect_journal_batch(cursor)
-            if logs:
+            hostname, cpu_load, mem_pct, disk_pct = collect_system_metrics()
+            cpu_used_pct = collect_cpu_utilization_pct()
+            threshold_alerts, next_threshold_state = detect_threshold_alerts(
+                cpu_used_pct,
+                mem_pct,
+                disk_pct,
+                threshold_state,
+                configuration=threshold_configuration,
+            )
+            telemetry = {
+                "hostname": hostname,
+                "cpu_load": cpu_load,
+                "mem_used_pct": mem_pct,
+                "disk_used_pct": disk_pct,
+            }
+            alert_parts = [logs] if logs else []
+            if threshold_alerts:
+                alert_parts.append("SentinelOps proactive telemetry threshold warning:\n- " + "\n- ".join(threshold_alerts))
+            if alert_parts:
                 try:
-                    ship_alert(logs, stack_tag="Linux")
+                    ship_alert("\n\n".join(alert_parts), stack_tag="Linux", telemetry=telemetry)
                 except RuntimeError as exc:
                     print(f"[Warn] Webhook delivery failed: {exc}")
                 else:
@@ -214,6 +366,17 @@ if __name__ == "__main__":
                             cursor = next_cursor
                         except OSError as exc:
                             print(f"[Warn] Could not save journal cursor: {exc}")
+                    try:
+                        _save_threshold_state(threshold_path, next_threshold_state)
+                        threshold_state = next_threshold_state
+                    except OSError as exc:
+                        print(f"[Warn] Could not save threshold state: {exc}")
+            elif next_threshold_state != threshold_state:
+                try:
+                    _save_threshold_state(threshold_path, next_threshold_state)
+                    threshold_state = next_threshold_state
+                except OSError as exc:
+                    print(f"[Warn] Could not save threshold state: {exc}")
             time.sleep(args.interval)
     else:
         logs = collect_live_journal_errors()

@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""
-SentinelOps Quantitative RAG Evaluation & Statistical Hypothesis Testing Script
-Generates empirical metrics (Hit Rate @ 3, MRR, Latency, PII Sanitizer Recall, Paired t-test)
-for Chapter 4 of the Amity University Online MCA Dissertation.
-"""
+"""Evaluate retrieval quality, index-build cost, query latency, and sanitizer coverage."""
+import json
 import os
 import sys
-import json
 import time
+
 import numpy as np
 from scipy import stats
 
@@ -15,65 +12,115 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 from app.retriever import HybridKnowledgeEngine
 from app.sanitizer import LogSanitizer
 
-BENCHMARK_PATH = os.path.join(os.path.dirname(__file__), "..", "backend", "data", "eval_benchmark.json")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "backend", "data")
+BENCHMARKS = (
+    ("Development", os.path.join(DATA_DIR, "eval_benchmark.json")),
+    ("Held-out", os.path.join(DATA_DIR, "eval_benchmark_holdout.json")),
+)
 
-def reciprocal_rank(retrieved_sources, expected_source):
-    for rank, src in enumerate(retrieved_sources, start=1):
-        if src == expected_source:
+SANITIZER_SAMPLES = (
+    {"raw": "ERROR peer=192.0.2.10 password=SamplePass-19", "forbidden": ["192.0.2.10", "SamplePass-19"]},
+    {"raw": "ERROR token=synthetic-token-123", "forbidden": ["synthetic-token-123"]},
+    {"raw": "ERROR Authorization: Bearer abc.def.synthetic", "forbidden": ["abc.def.synthetic"]},
+    {"raw": "ERROR AWS key AKIAIOSFODNN7EXAMPLE rejected", "forbidden": ["AKIAIOSFODNN7EXAMPLE"]},
+    {"raw": "ERROR URL https://user:syntheticpass@example.invalid/db", "forbidden": ["syntheticpass"]},
+    {"raw": "ERROR secret='example-secret-value'", "forbidden": ["example-secret-value"]},
+    {"raw": "ERROR api_key=fake-api-key-value", "forbidden": ["fake-api-key-value"]},
+    {"raw": "ERROR passwd:sample-pass-77", "forbidden": ["sample-pass-77"]},
+    {
+        "raw": "ERROR key -----BEGIN RSA PRIVATE KEY-----\nsynthetic-private-key-material\n-----END RSA PRIVATE KEY-----",
+        "forbidden": ["synthetic-private-key-material"],
+    },
+    {"raw": "ERROR peer 203.0.113.8 disconnected", "forbidden": ["203.0.113.8"]},
+    {"raw": "ERROR bind 0.0.0.0:80; upstream 127.0.0.1:8000", "preserve": ["0.0.0.0", "127.0.0.1"]},
+)
+
+
+def reciprocal_rank(retrieved_sources, expected_sources):
+    expected = set(expected_sources) if isinstance(expected_sources, list) else {expected_sources}
+    for rank, source in enumerate(retrieved_sources, start=1):
+        if source in expected:
             return 1.0 / rank
     return 0.0
 
-def main():
-    engine = HybridKnowledgeEngine()
-    with open(BENCHMARK_PATH, "r", encoding="utf-8") as f:
-        dataset = json.load(f)
 
-    vec_rr, bm25_rr, hyb_rr = [], [], []
-    latencies_ms = []
-
+def evaluate_dataset(engine, dataset):
+    vector_rr, bm25_rr, hybrid_rr, latencies_ms = [], [], [], []
     for item in dataset:
-        q = item["query"]
-        exp = item["expected_source"]
+        query = item["query"]
+        expected = item.get("expected_sources", item["expected_source"])
+        vector_sources = [row["meta"]["source"] for row in engine.search_vector_only(query, top_k=3)]
+        bm25_sources = [row["meta"]["source"] for row in engine.search_bm25_only(query, top_k=3)]
+        started = time.perf_counter()
+        hybrid_sources = [
+            row["meta"]["source"]
+            for row in engine.search_hybrid(query, stack_filter=item["stack"], top_k=3)
+        ]
+        latencies_ms.append((time.perf_counter() - started) * 1000.0)
+        vector_rr.append(reciprocal_rank(vector_sources, expected))
+        bm25_rr.append(reciprocal_rank(bm25_sources, expected))
+        hybrid_rr.append(reciprocal_rank(hybrid_sources, expected))
+    return {
+        "count": len(dataset),
+        "vector_rr": vector_rr,
+        "bm25_rr": bm25_rr,
+        "hybrid_rr": hybrid_rr,
+        "latencies_ms": latencies_ms,
+    }
 
-        v_res = [r["meta"]["source"] for r in engine.search_vector_only(q, top_k=3)]
-        b_res = [r["meta"]["source"] for r in engine.search_bm25_only(q, top_k=3)]
 
-        t0 = time.perf_counter()
-        h_res = [r["meta"]["source"] for r in engine.search_hybrid(q, stack_filter=item["stack"], top_k=3)]
-        latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+def sanitizer_coverage():
+    passed = 0
+    for sample in SANITIZER_SAMPLES:
+        sanitized, _, _ = LogSanitizer.filter_and_sanitize(sample["raw"])
+        secrets_removed = all(value not in sanitized for value in sample.get("forbidden", []))
+        local_addresses_preserved = all(value in sanitized for value in sample.get("preserve", []))
+        passed += int(secrets_removed and local_addresses_preserved)
+    return passed, len(SANITIZER_SAMPLES)
 
-        vec_rr.append(reciprocal_rank(v_res, exp))
-        bm25_rr.append(reciprocal_rank(b_res, exp))
-        hyb_rr.append(reciprocal_rank(h_res, exp))
 
-    vec_hit3 = np.mean([1 if x > 0 else 0 for x in vec_rr]) * 100
-    bm25_hit3 = np.mean([1 if x > 0 else 0 for x in bm25_rr]) * 100
-    hyb_hit3 = np.mean([1 if x > 0 else 0 for x in hyb_rr]) * 100
+def report_dataset(name, result):
+    hybrid_rr = result["hybrid_rr"]
+    latencies = result["latencies_ms"]
+    hit_at_3 = np.mean([rank > 0 for rank in hybrid_rr]) * 100.0
+    print(
+        f"{name:12} N={result['count']:2} | "
+        f"Hybrid Hit@3={hit_at_3:6.2f}% | MRR={np.mean(hybrid_rr):.4f} | "
+        f"mean={np.mean(latencies):.2f} ms | p95={np.percentile(latencies, 95):.2f} ms"
+    )
+    print(
+        f"             Vector MRR={np.mean(result['vector_rr']):.4f} | "
+        f"BM25 MRR={np.mean(result['bm25_rr']):.4f}"
+    )
 
-    t_stat, p_val = stats.ttest_rel(hyb_rr, vec_rr)
 
-    pii_samples = [
-        "Error from 192.168.1.45 using AWS key AKIAIOSFODNN7EXAMPLE",
-        "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc.def",
-        "DB password=MySecretPassword123! connection failed on 10.24.0.9"
-    ]
-    masked_ok = 0
-    for s in pii_samples:
-        cleaned, redactions, _ = LogSanitizer.filter_and_sanitize(s)
-        if len(redactions) > 0 and "192.168" not in cleaned and "AKIA" not in cleaned and "MySecret" not in cleaned:
-            masked_ok += 1
+def main():
+    build_started = time.perf_counter()
+    engine = HybridKnowledgeEngine()
+    build_seconds = time.perf_counter() - build_started
+    datasets = []
+    for name, path in BENCHMARKS:
+        with open(path, "r", encoding="utf-8") as benchmark_file:
+            dataset = json.load(benchmark_file)
+        datasets.append((name, evaluate_dataset(engine, dataset)))
 
-    print("=================================================================")
-    print("  SENTINELOPS EMPIRICAL EVALUATION & HYPOTHESIS TEST RESULTS")
-    print("=================================================================")
-    print(f"Benchmark Queries (N)         : {len(dataset)}")
-    print(f"Dense Vector Only Hit@3 / MRR : {vec_hit3:.2f}%  | MRR = {np.mean(vec_rr):.4f}")
-    print(f"Sparse BM25 Only  Hit@3 / MRR : {bm25_hit3:.2f}%  | MRR = {np.mean(bm25_rr):.4f}")
-    print(f"Hybrid RRF (Ours) Hit@3 / MRR : {hyb_hit3:.2f}%  | MRR = {np.mean(hyb_rr):.4f}")
-    print(f"Paired t-test (Hybrid vs Vec) : t = {t_stat:.4f}, p = {p_val:.4f}")
-    print(f"Mean Hybrid Retrieval Latency : {np.mean(latencies_ms):.2f} ms (SD = {np.std(latencies_ms):.2f} ms)")
-    print(f"Regex PII Sanitizer Recall    : {(masked_ok/len(pii_samples))*100:.2f}% ({masked_ok}/{len(pii_samples)})")
-    print("=================================================================")
+    development = datasets[0][1]
+    t_stat, p_value = stats.ttest_rel(development["hybrid_rr"], development["vector_rr"])
+    sanitizer_passed, sanitizer_total = sanitizer_coverage()
+    print("=" * 84)
+    print("SENTINELOPS RETRIEVAL AND SAFETY EVALUATION")
+    print("=" * 84)
+    print(f"Indexed chunks             : {len(engine.documents)}")
+    print(f"Index build time           : {build_seconds:.2f} seconds")
+    for name, result in datasets:
+        report_dataset(name, result)
+    print(f"Development paired t-test  : t={t_stat:.4f}, p={p_value:.4f}")
+    print(
+        f"Sanitizer cases passed     : {sanitizer_passed}/{sanitizer_total} "
+        "(synthetic secret removal and local-address preservation)"
+    )
+    print("=" * 84)
+
 
 if __name__ == "__main__":
     main()

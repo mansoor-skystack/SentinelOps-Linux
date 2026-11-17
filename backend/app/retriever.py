@@ -10,6 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 RUNBOOKS_DIR = os.path.join(DATA_DIR, "runbooks")
+PUBLIC_REFERENCE_DIR = os.path.join(DATA_DIR, "public-reference", "tldr")
 CSV_PATH = os.path.join(DATA_DIR, "incidents_dataset.csv")
 
 def tokenize(text: str) -> List[str]:
@@ -67,11 +68,16 @@ class HybridKnowledgeEngine:
         docs: List[str] = []
         metas: List[Dict[str, str]] = []
 
-        if os.path.exists(RUNBOOKS_DIR):
-            for fname in sorted(os.listdir(RUNBOOKS_DIR)):
-                if not fname.endswith(".md"):
+        for directory, document_type in (
+            (RUNBOOKS_DIR, "verified_runbook"),
+            (PUBLIC_REFERENCE_DIR, "public_reference"),
+        ):
+            if not os.path.exists(directory):
+                continue
+            for fname in sorted(os.listdir(directory)):
+                if not fname.endswith(".md") or fname in {"TLDR_ATTRIBUTION.md", "TLDR_LICENSE.md"}:
                     continue
-                with open(os.path.join(RUNBOOKS_DIR, fname), "r", encoding="utf-8") as f:
+                with open(os.path.join(directory, fname), "r", encoding="utf-8") as f:
                     raw = f.read()
                 sections = re.split(r"(?=^##\s+)", raw, flags=re.MULTILINE)
                 for sec in sections:
@@ -79,8 +85,13 @@ class HybridKnowledgeEngine:
                     if not sec:
                         continue
                     first_line = sec.splitlines()[0].lstrip("#").strip()
+                    source = f"tldr/{fname}" if document_type == "public_reference" else fname
                     docs.append(sec)
-                    metas.append({"source": fname, "section": first_line[:80], "type": "runbook"})
+                    metas.append({
+                        "source": source,
+                        "section": first_line[:80],
+                        "type": document_type,
+                    })
 
         if os.path.exists(CSV_PATH):
             with open(CSV_PATH, "r", encoding="utf-8") as f:
@@ -136,7 +147,7 @@ class HybridKnowledgeEngine:
 
         for idx in list(rrf.keys()):
             meta = self.metadatas[idx]
-            if meta.get("type") == "runbook":
+            if meta.get("type") == "verified_runbook":
                 rrf[idx] *= 1.35
             if stack_filter and stack_filter != "All":
                 if stack_filter.lower() in meta.get("source", "").lower() or stack_filter.lower() == meta.get("stack", "").lower():
