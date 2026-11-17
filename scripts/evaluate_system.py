@@ -8,11 +8,14 @@ import time
 import numpy as np
 from scipy import stats
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BACKEND_DIR = os.path.join(REPOSITORY_ROOT, "backend")
+sys.path.insert(0, REPOSITORY_ROOT)
+sys.path.insert(0, BACKEND_DIR)
 from app.retriever import HybridKnowledgeEngine
 from app.sanitizer import LogSanitizer
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "backend", "data")
+DATA_DIR = os.path.join(BACKEND_DIR, "data")
 BENCHMARKS = (
     ("Development", os.path.join(DATA_DIR, "eval_benchmark.json")),
     ("Held-out", os.path.join(DATA_DIR, "eval_benchmark_holdout.json")),

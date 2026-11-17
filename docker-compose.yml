@@ -1,9 +1,9 @@
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:16
     depends_on:
       ssh-keys:
-        condition: service_completed_successfully-alpine
+        condition: service_completed_successfully
     environment:
       POSTGRES_DB: sentinelops
       POSTGRES_USER: sentinelops
