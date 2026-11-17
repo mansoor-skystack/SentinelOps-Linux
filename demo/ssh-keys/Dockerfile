@@ -1,6 +1,7 @@
 FROM debian:bookworm-slim
 
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends openssh-client openssl \
     && rm -rf /var/lib/apt/lists/*
 
