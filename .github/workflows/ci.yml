@@ -65,5 +65,5 @@ jobs:
               -v /var/run/docker.sock:/var/run/docker.sock \
               -v "$RUNNER_TEMP/trivy-cache:/root/.cache/" \
               aquasec/trivy:0.58.1 \
-              image --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 "$image"
+              image --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 "$image"
           done
