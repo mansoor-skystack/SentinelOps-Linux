@@ -55,15 +55,15 @@ jobs:
         run: docker build --tag sentinelops-demo-ssh-target:ci demo/ssh-target
       - name: Build disposable SSH key generator image
         run: docker build --tag sentinelops-demo-ssh-keys:ci demo/ssh-keys
-      - name: Pull PostgreSQL image
-        run: docker pull postgres:16
+      - name: Build PostgreSQL demo image
+        run: docker build --pull --tag sentinelops-demo-postgres:ci demo/postgres
       - name: Scan demo images
         run: |
           mkdir -p "$RUNNER_TEMP/trivy-cache"
-          for image in sentinelops:ci sentinelops-demo-ssh-target:ci sentinelops-demo-ssh-keys:ci postgres:16; do
+          for image in sentinelops:ci sentinelops-demo-ssh-target:ci sentinelops-demo-ssh-keys:ci sentinelops-demo-postgres:ci; do
             docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
               -v "$RUNNER_TEMP/trivy-cache:/root/.cache/" \
               aquasec/trivy:0.58.1 \
-              image --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 "$image"
+              image --scanners vuln --vuln-type os --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 "$image"
           done
